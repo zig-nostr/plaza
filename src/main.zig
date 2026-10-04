@@ -2242,6 +2242,17 @@ pub fn isRelayUrl(url: []const u8) bool {
     if (!std.mem.startsWith(u8, url, "wss://")) return false;
     const rest = url["wss://".len..];
     if (rest.len == 0 or rest.len > 80) return false;
+    // No whitespace and no control byte anywhere. This string is written to the
+    // relays file one relay per line and sent in the handshake's request line,
+    // so a newline or a BEL in it is not a typo, it is a different file or a
+    // different request.
+    for (url) |c| {
+        if (c <= 0x20 or c == 0x7f) return false;
+    }
+    // And the same reading of the address the dialler will give it, so a port
+    // that is not a number is refused here rather than listed, counted, and
+    // retried forever.
+    _ = nostr.relay.parseUrl(url) catch return false;
     // A host, at least: something before the first slash, with a dot in it.
     const host_end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
     const host = rest[0..host_end];
@@ -6948,6 +6959,31 @@ pub fn mediaDirectFallback() bool {
 
 pub fn setMediaDirectFallback(on: bool) void {
     g_media_direct_fallback = on;
+}
+
+/// Whether a typed proxy base is one this app can build a request from: an
+/// `http://` or `https://` address that names a host, with no space or control
+/// byte in it, short enough for the buffer it is kept in. Empty is not asked
+/// here, because empty is a choice (load originals) and the caller decides it.
+///
+/// Plain `http://` is allowed, unlike a relay: the proxy is the reader's own
+/// pick, often an instance on their own network, and what it carries is
+/// pictures that were public to begin with.
+pub fn isMediaProxyUrl(url: []const u8) bool {
+    const rest = if (std.mem.startsWith(u8, url, "https://"))
+        url["https://".len..]
+    else if (std.mem.startsWith(u8, url, "http://"))
+        url["http://".len..]
+    else
+        return false;
+    if (url.len > g_media_proxy_buf.len) return false;
+    for (url) |c| {
+        if (c <= 0x20 or c == 0x7f) return false;
+    }
+    const host_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    const host = rest[0..host_end];
+    if (host.len == 0 or host[0] == ':') return false;
+    return std.mem.indexOfScalar(u8, host, '@') == null;
 }
 
 pub fn setMediaProxy(url: []const u8) void {
@@ -12206,6 +12242,8 @@ pub const Model = struct {
     // The media-proxy field in Settings (see `g_media_proxy_buf`).
     proxy_buffer: canvas.TextBuffer(200) = .{},
     proxy_saved: bool = false,
+    // The last Save was refused because what is in the field is not an address.
+    proxy_invalid: bool = false,
     // The Edit profile sheet: whether it is open, what is in its fields, and
     // whether the app has the reader's current profile to merge into.
     editing_profile: bool = false,
@@ -12242,6 +12280,8 @@ pub const Model = struct {
     blossom_error: BlossomEdit = .none,
     // The description of the picture waiting to be uploaded from the composer.
     upload_alt_buffer: canvas.TextBuffer(200) = .{},
+    // The last Remove was refused because it would have emptied the list.
+    relay_last: bool = false,
     // Which note's picture is expanded to fill the window, if any.
     expanded_note: ?i64 = null,
     /// Which of that note's pictures the viewer is showing. Zero for a note with
@@ -12392,6 +12432,11 @@ pub const Model = struct {
     // only at the top. The windowed list replaces this estimate with the
     // runtime's exact visible range in the next milestone.
     feed_scroll: canvas.ScrollState = .{},
+    // Settings' own scroll offset. Echoed from the scroll view and bound back to
+    // it, which is what lets a press move the page: asking to log out grows the
+    // page at its foot, and the question has to be scrolled into view or it is
+    // answered by nobody.
+    settings_scroll_y: f32 = 0,
     // How many notes the feed currently asks the store for; grows a page at a
     // time as the reader reaches the end.
     feed_limit: usize = feed_page,
@@ -12405,44 +12450,44 @@ pub const Model = struct {
     // now, so markup never binds its state (the welcome and Settings fragments
     // still bind theirs, and are still checked).
     pub const view_unbound = .{
-        "notes",                  "notes_len",              "live_relays",            "offline_relays",            "draft_buffer",
-        "stage",                  "login_buffer",           "logout_pending",         "proxy_buffer",              "proxy_saved",
-        "feed_scroll",            "feed_limit",             "draft",                  "draft_empty",               "identity",
-        "has_notes",              "empty",                  "status",                 "empty_text",                "footer",
-        "note_list",              "expanded_note",          "composing",              "caught_up",                 "relay_health",
-        "relays_online",          "scope_voices",           "is_guest",               "show_guest_strip",          "guest_strip_dismissed",
-        "joining",                "pending",                "naming",                 "name_buffer",               "name_draft",
-        "name_empty",             "toast_buf",              "toast_len",              "toast_until",               "toast_text",
-        "backup_nudge",           "backup_nudge_dismissed", "bunker_mode",            "pending_text",              "viewing_thread",
-        "reply_buffer",           "reply_draft",            "reply_empty",            "thread_root",               "thread_notes",
-        "thread_notes_len",       "thread_stack",           "thread_stack_len",       "thread_loading",            "thread_seq",
-        "thread_open_at",         "address_open",           "address_buffer",         "address_error",             "address_draft",
-        "address_empty",          "address_status",         "address_action",
+        "notes",                     "notes_len",              "live_relays",            "offline_relays",         "draft_buffer",
+        "stage",                     "login_buffer",           "logout_pending",         "proxy_buffer",           "proxy_saved",
+        "feed_scroll",               "feed_limit",             "draft",                  "draft_empty",            "identity",
+        "has_notes",                 "empty",                  "status",                 "empty_text",             "footer",
+        "note_list",                 "expanded_note",          "composing",              "caught_up",              "relay_health",
+        "relays_online",             "scope_voices",           "is_guest",               "show_guest_strip",       "guest_strip_dismissed",
+        "joining",                   "pending",                "naming",                 "name_buffer",            "name_draft",
+        "name_empty",                "toast_buf",              "toast_len",              "toast_until",            "toast_text",
+        "backup_nudge",              "backup_nudge_dismissed", "bunker_mode",            "pending_text",           "viewing_thread",
+        "reply_buffer",              "reply_draft",            "reply_empty",            "thread_root",            "thread_notes",
+        "thread_notes_len",          "thread_stack",           "thread_stack_len",       "thread_loading",         "thread_seq",
+        "thread_open_at",            "address_open",           "address_buffer",         "address_error",          "address_draft",
+        "address_empty",             "address_status",         "address_action",         "proxy_invalid",          "settings_scroll_y",
         // Read by the Zig view rather than bound by name in markup. The one
         // markup file is the join screen; everything else this app draws, it
         // draws itself, so these are unbound by design rather than by mistake.
         // Listed so the check has nothing left to say, and a NEW unbound field
         // stands out against silence instead of hiding in a hundred lines.
-                "can_open_notary",           "client_tag_explainer",
-        "client_tag_on",          "currentLevel",           "deleting_note",          "direct_fallback_explainer", "direct_fallback_on",
-        "draft_dropped",          "editing_profile",        "expanded_image",         "levelOpen",                 "logout_idle",
-        "logout_warning",         "mention_dismissed",      "mentionsOff",            "mentions_off",              "mentions_off_len",
-        "menu",                   "notifications_everyone", "notifications_open",     "notifications_return",      "outbox_label",
-        "outbox_overflowed",      "outbox_pending",         "outbox_stuck",           "post_delay_explainer",      "post_delay_label",
-        "previews_explainer",     "previews_on",            "profile_about",          "profile_about_buffer",      "profile_about_long",
-        "profile_asked_at",       "profile_can_save",       "profile_name",           "profile_name_buffer",       "profile_name_key",
-        "profile_name_long",      "profile_picture",        "profile_picture_buffer", "profile_picture_long",      "profile_seeded",
-        "profile_stage",          "profile_banner",         "profile_banner_buffer",  "profile_banner_long",       "profile_invalid",
-        "profile_lud16",          "profile_lud16_buffer",   "profile_lud16_long",     "profile_nip05",             "profile_nip05_buffer",
-        "profile_nip05_long",     "profile_website",        "profile_website_buffer", "profile_website_long",      "profile_status",
-        "profile_tab",            "profile_untouched",      "proxy_draft",            "proxy_explainer",           "proxy_on",
-        "proxy_status",           "relay_buffer",           "relay_count",            "relay_draft",               "relay_error",
-        "relay_full",             "relay_status",           "relays_paused",          "scope_name",                "sensitive_explainer",
-        "sensitive_on",           "signer_line",            "signer_sub",             "warn_buffer",               "warn_draft",
-        "warn_on",                "thread_outside_open",    "thread_page",            "topic_buf",                 "topic_len",
-        "update_check_explainer", "update_check_on",        "version_line",           "viewingTopic",              "viewing_bookmarks",
-        "blossom_buffer",         "blossom_draft",          "blossom_error",          "blossom_status",            "upload_alt",
-        "upload_alt_buffer",      "profile_limit",          "profile_autofill",       "profile_asked_until",
+        "can_open_notary",           "client_tag_explainer",   "client_tag_on",          "currentLevel",           "deleting_note",
+        "direct_fallback_explainer", "direct_fallback_on",     "draft_dropped",          "editing_profile",        "expanded_image",
+        "levelOpen",                 "logout_idle",            "logout_warning",         "mention_dismissed",      "mentionsOff",
+        "mentions_off",              "mentions_off_len",       "menu",                   "notifications_everyone", "notifications_open",
+        "notifications_return",      "outbox_label",           "outbox_overflowed",      "outbox_pending",         "outbox_stuck",
+        "post_delay_explainer",      "post_delay_label",       "previews_explainer",     "previews_on",            "profile_about",
+        "profile_about_buffer",      "profile_about_long",     "profile_asked_at",       "profile_can_save",       "profile_name",
+        "profile_name_buffer",       "profile_name_key",       "profile_name_long",      "profile_picture",        "profile_picture_buffer",
+        "profile_picture_long",      "profile_seeded",         "profile_stage",          "profile_banner",         "profile_banner_buffer",
+        "profile_banner_long",       "profile_invalid",        "profile_lud16",          "profile_lud16_buffer",   "profile_lud16_long",
+        "profile_nip05",             "profile_nip05_buffer",   "profile_nip05_long",     "profile_website",        "profile_website_buffer",
+        "profile_website_long",      "profile_status",         "profile_tab",            "profile_untouched",      "proxy_draft",
+        "proxy_explainer",           "proxy_on",               "proxy_status",           "relay_buffer",           "relay_count",
+        "relay_draft",               "relay_error",            "relay_full",             "relay_status",           "relays_paused",
+        "scope_name",                "sensitive_explainer",    "sensitive_on",           "signer_line",            "signer_sub",
+        "warn_buffer",               "warn_draft",             "warn_on",                "thread_outside_open",    "thread_page",
+        "topic_buf",                 "topic_len",              "update_check_explainer", "update_check_on",        "version_line",
+        "viewingTopic",              "viewing_bookmarks",      "blossom_buffer",         "blossom_draft",          "blossom_error",
+        "blossom_status",            "upload_alt",             "upload_alt_buffer",      "profile_limit",          "profile_autofill",
+        "profile_asked_until",       "relay_last",
     };
 
     /// Why the join sheet is up, in the reader's own terms. Empty when they
@@ -12640,6 +12685,7 @@ pub const Model = struct {
     }
     /// Confirmation under the media-proxy field.
     pub fn proxy_status(self: *const Model) []const u8 {
+        if (self.proxy_invalid) return "Not saved. A proxy address starts with https:// or http:// and names a host.";
         if (!self.proxy_saved) return "";
         return if (g_media_proxy_len == 0) "Saved. Loading originals directly." else "Saved.";
     }
@@ -12816,6 +12862,7 @@ pub const Model = struct {
     }
     /// Why the last Add did nothing, said in the field's own terms.
     pub fn relay_status(self: *const Model) []const u8 {
+        if (self.relay_last) return "Plaza needs at least one relay. Add another first, then remove this one.";
         if (self.relay_full) return "That's the most relays this app keeps. Remove one first.";
         if (self.relay_error) return "A relay address starts with wss:// and names a host.";
         // Last, because the two above are about the press that just happened
@@ -18144,6 +18191,8 @@ pub const Msg = union(enum) {
     client_tag_toggle,
     /// The feed scrolled: remember where, so images load around the viewport.
     feed_scrolled: canvas.ScrollState,
+    /// Where Settings is scrolled, echoed back so a press can move it.
+    settings_scrolled: canvas.ScrollState,
     /// A link in a note was pressed: open it in the browser.
     open_url: []const u8,
     /// The animation timer fired: advance any playing GIFs.
@@ -18257,6 +18306,7 @@ pub const Msg = union(enum) {
         "helper_signed",
         "open_settings",
         "feed_scrolled",
+        "settings_scrolled",
         "open_url",
         "expand_image",
         "expand_image_at",
@@ -18452,7 +18502,7 @@ fn settingsSheet(ui: *AppUi, model: *const Model) AppUi.Node {
     }, .{
         settingsHeader(ui),
         ui.el(.separator, .{ .style = .{ .background = p.divider_chrome } }, .{}),
-        ui.scroll(.{ .grow = 1 }, .{
+        ui.scroll(.{ .grow = 1, .value = model.settings_scroll_y, .on_scroll = AppUi.scrollMsg(.settings_scrolled) }, .{
             ui.row(.{ .gap = 0 }, .{
                 ui.spacer(1),
                 ui.column(.{ .gap = settings_section_gap, .width = settings_column_width }, .{
@@ -18889,15 +18939,34 @@ fn feedCard(ui: *AppUi, model: *const Model) AppUi.Node {
                 .height = 30,
             }, .{}),
             ui.inputGroupActions(.{}, .{
-                ui.paragraph(
-                    .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_dim } },
-                    &.{.{ .text = model.proxy_status(), .scale = mono_hint_scale }},
-                ),
+                ui.spacer(1),
                 ui.button(.{ .size = .sm, .on_press = Msg.proxy_save }, "Save"),
             }),
         ),
+        fieldNote(ui, model.proxy_status(), model.proxy_invalid),
     });
 }
+
+/// What a settings field has to say about itself, under the field rather than
+/// beside its button. A sentence squeezed into the strip next to a button wraps
+/// into a box that has a fixed height, and its second line ends up drawn over
+/// whatever follows; under the field it has the card's whole width and pushes
+/// the rest down instead. Nothing at all when there is nothing to say.
+fn fieldNote(ui: *AppUi, text: []const u8, refusal: bool) AppUi.Node {
+    if (text.len == 0) return ui.spacer(0);
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 7),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = if (refusal) p.status_warning_text else p.text_dim } },
+            &.{.{ .text = text, .scale = mono_hint_scale }},
+        ),
+    });
+}
+
+/// A scroll offset past any page Settings can be. The scroll view clamps a
+/// requested offset to the end of its content, so this means "the bottom".
+pub const settings_scroll_end: f32 = 1.0e6;
 
 /// Signing out: one press to ask, one card to confirm. The card is the whole
 /// section when it is up, because a confirmation that shares a row with other
@@ -18936,6 +19005,11 @@ fn cycleRelay(i: usize) void {
         e.read = true;
         e.write = true;
     }
+}
+
+/// Whether a relay may be taken out of the list: only while another remains.
+fn mayRemoveRelay() bool {
+    return relayCount() > 1;
 }
 
 /// Drops a relay. The SLOT stays claimed and dormant: its index is a promise to
@@ -19263,7 +19337,6 @@ pub fn relayShortName(url: []const u8) []const u8 {
 
 /// Where a relay is added, and where the ones your follows use are offered.
 fn relayAddRow(ui: *AppUi, model: *const Model) AppUi.Node {
-    const p = theme.palette;
     return ui.column(.{ .gap = 0 }, .{
         ui.inputGroup(
             .{ .semantics = .{ .label = "Add a relay" } },
@@ -19275,13 +19348,11 @@ fn relayAddRow(ui: *AppUi, model: *const Model) AppUi.Node {
                 .height = 30,
             }, .{}),
             ui.inputGroupActions(.{}, .{
-                ui.paragraph(
-                    .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_dim } },
-                    &.{.{ .text = model.relay_status(), .scale = mono_meta_scale }},
-                ),
+                ui.spacer(1),
                 ui.button(.{ .size = .sm, .on_press = Msg.relay_add }, "Add"),
             }),
         ),
+        fieldNote(ui, model.relay_status(), model.relay_error or model.relay_full or model.relay_last),
         relaySuggestions(ui, model),
     });
 }
@@ -28130,6 +28201,14 @@ pub fn placeLogoShownForTest() bool {
     return g_place_logo_state == .loaded and g_place_logo_id != 0;
 }
 
+/// A real effect queue whose requests are only recorded, so a handler that asks
+/// for a clipboard write or a timer can run to its end in a test. The caller
+/// owns it and must `deinit` it.
+pub fn recordingEffectsForTest(fx: *Effects, allocator: std.mem.Allocator) void {
+    fx.* = Effects.init(allocator);
+    fx.executor = .fake;
+}
+
 /// An `Effects` bound to nothing, so every effect asked of it is refused. The
 /// tests below drive a DECISION, not an effect, and the alternative is passing
 /// `undefined` and hoping the path taken never reads it.
@@ -29201,6 +29280,9 @@ fn offlineBanner(ui: *AppUi, model: *const Model) AppUi.Node {
     const p = theme.palette;
     if (liveRelayCount() > 0) return ui.spacer(0);
     const queued = model.outbox_pending;
+    // A pause is the reader's own doing, so it is not worded or coloured as a
+    // fault, and it carries the way out.
+    if (model.relays_paused) return pausedBanner(ui, queued);
     return ui.column(.{ .gap = 0 }, .{
         vgap(ui, 8),
         ui.row(.{ .gap = 0 }, .{
@@ -29219,7 +29301,7 @@ fn offlineBanner(ui: *AppUi, model: *const Model) AppUi.Node {
                             hgap(ui, 8),
                             ui.paragraph(
                                 .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.status_warning_text } },
-                                &.{.{ .text = offlineBannerText(ui, queued), .scale = meta_scale }},
+                                &.{.{ .text = offlineBannerText(ui, queued, relayCount() == 0), .scale = meta_scale }},
                             ),
                         }),
                         vgap(ui, 8),
@@ -29385,15 +29467,74 @@ fn relayAuthBanner(ui: *AppUi) AppUi.Node {
     });
 }
 
-/// What the banner says, which depends on whether anything is owed.
-fn offlineBannerText(ui: *AppUi, queued: usize) []const u8 {
+/// The strip shown while the reader has paused the relays. The update notice's
+/// quieter tone, because nothing is broken, and one press to undo it.
+fn pausedBanner(ui: *AppUi, queued: usize) AppUi.Node {
+    const p = theme.palette;
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 8),
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, chrome_inset),
+            ui.el(.panel, .{
+                .grow = 1,
+                .padding = 0.01,
+                .style = .{ .background = p.surface_menu, .border = p.border_menu, .radius = 8, .stroke_width = 1 },
+            }, .{
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    hgap(ui, 11),
+                    ui.column(.{ .gap = 0 }, .{
+                        vgap(ui, 8),
+                        ui.row(.{ .cross = .center, .gap = 0 }, .{
+                            ui.paragraph(
+                                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_body } },
+                                &.{.{ .text = pausedBannerText(ui, queued), .scale = meta_scale }},
+                            ),
+                            hgap(ui, 12),
+                            pressRow(ui, .{
+                                .cross = .center,
+                                .gap = 0,
+                                .on_press = Msg.toggle_relays_paused,
+                                .style = .{ .quiet_hover = true },
+                                .semantics = .{ .role = .button, .label = "Resume relays", .focusable = true },
+                            }, .{
+                                ui.paragraph(
+                                    .{ .style = .{ .foreground = p.text_primary } },
+                                    &.{.{ .text = "Resume", .weight = .medium, .underline = true, .scale = meta_scale }},
+                                ),
+                            }),
+                        }),
+                        vgap(ui, 8),
+                    }),
+                    hgap(ui, 11),
+                }),
+            }),
+            hgap(ui, chrome_inset),
+        }),
+    });
+}
+
+fn pausedBannerText(ui: *AppUi, queued: usize) []const u8 {
+    if (queued == 0) return "Relays are paused. Reading continues from this machine, and anything you write is kept until you resume.";
+    return ui.fmt("Relays are paused. Reading continues from this machine, and {d} {s} waiting to go out until you resume.", .{ queued, if (queued == 1) "note is" else "notes are" });
+}
+
+pub fn pausedBannerTextForTest(arena: std.mem.Allocator, queued: usize) []const u8 {
+    var ui = AppUi.init(arena);
+    return pausedBannerText(&ui, queued);
+}
+
+/// What the banner says, which depends on whether anything is owed, and on
+/// whether the pool is empty: "no relay is answering" is wrong about a list
+/// with nobody in it, and sends the reader looking for a fault.
+fn offlineBannerText(ui: *AppUi, queued: usize, none_set: bool) []const u8 {
+    if (none_set) return "No relays are set up, so nothing can be fetched or sent. Add one in Settings.";
     if (queued == 0) return "No relay is answering. Reading continues from this machine; anything you write is kept until one does.";
     return ui.fmt("No relay is answering. Reading continues from this machine, and {d} {s} waiting to go out.", .{ queued, if (queued == 1) "note is" else "notes are" });
 }
 
-pub fn offlineBannerTextForTest(arena: std.mem.Allocator, queued: usize) []const u8 {
+pub fn offlineBannerTextForTest(arena: std.mem.Allocator, queued: usize, none_set: bool) []const u8 {
     var ui = AppUi.init(arena);
-    return offlineBannerText(&ui, queued);
+    return offlineBannerText(&ui, queued, none_set);
 }
 
 /// What the app still owes the reader. Absent when nothing is queued, which is
@@ -34152,9 +34293,19 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             relayListEdited();
         },
         .relay_remove => |i| {
+            // The last relay stays. With none, nothing is read and nothing is
+            // written, and the empty list would be what gets published over the
+            // one this account already has. Replacing it is add-then-remove.
+            if (!mayRemoveRelay()) {
+                model.relay_last = true;
+                model.relay_full = false;
+                model.relay_error = false;
+                return;
+            }
             removeRelay(i);
             // They just did what the full-pool message asked for.
             model.relay_full = false;
+            model.relay_last = false;
             relayListEdited();
         },
         .relay_edit => |edit| {
@@ -34164,6 +34315,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // like it is not watching.
             model.relay_error = false;
             model.relay_full = false;
+            model.relay_last = false;
         },
         .relay_add => {
             const typed = std.mem.trim(u8, model.relay_buffer.text(), " \t\r\n");
@@ -34172,6 +34324,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // next add failed.
             model.relay_full = false;
             model.relay_error = false;
+            model.relay_last = false;
             if (!isRelayUrl(typed)) {
                 model.relay_error = true;
                 return;
@@ -34193,6 +34346,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 return;
             }
             model.relay_full = false;
+            model.relay_last = false;
             forgetRelaySuggestion(i);
             relayListEdited();
         },
@@ -34585,9 +34739,19 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .proxy_edit => |edit| {
             model.proxy_buffer.apply(edit);
             model.proxy_saved = false;
+            model.proxy_invalid = false;
         },
         .proxy_save => {
-            setMediaProxy(model.proxy_buffer.text());
+            const typed = std.mem.trim(u8, model.proxy_buffer.text(), " \t\r\n");
+            // Empty is a choice (load originals); anything else has to be an
+            // address. Kept in the field so it can be fixed rather than retyped.
+            if (typed.len != 0 and !isMediaProxyUrl(typed)) {
+                model.proxy_invalid = true;
+                model.proxy_saved = false;
+                return;
+            }
+            model.proxy_invalid = false;
+            setMediaProxy(typed);
             saveSettings();
             model.proxy_saved = true;
             // Retry anything that failed to load under the previous setting.
@@ -34763,6 +34927,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             fireReply(model, fx, null);
         },
         .toggle_expand => |note_id| toggleExpanded(note_id),
+        .settings_scrolled => |scroll| model.settings_scroll_y = scroll.offset_y,
         .feed_scrolled => |scroll| {
             model.feed_scroll = scroll;
             // Load what just came into view without waiting for the next tick:
@@ -34807,6 +34972,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             var fba = std.heap.FixedBufferAllocator.init(&scratch);
             const npub = nostr.nip19.encodeNpub(fba.allocator(), pk) catch return;
             writeClipboardText(fx, copy_npub_key, npub);
+            setToast(model, "npub copied");
         },
         .copy_nprofile => {
             const pk = activePubkey() orelse return;
@@ -34816,7 +34982,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.menu = .none;
             setToast(model, "Profile address copied");
         },
-        .logout_request => model.logout_pending = true,
+        .logout_request => {
+            model.logout_pending = true;
+            // The question is taller than the button it replaces and sits at the
+            // very foot of the page, so it opens below the window's edge. The
+            // scroll view clamps this to the end of the content.
+            model.settings_scroll_y = settings_scroll_end;
+        },
         .logout_cancel => model.logout_pending = false,
         .logout_confirm => performLogout(model, fx),
     }
@@ -34939,6 +35111,8 @@ fn enterSettings(model: *Model) void {
     model.notifications_open = false;
     model.proxy_buffer.set(mediaProxy());
     model.proxy_saved = false;
+    model.proxy_invalid = false;
+    model.settings_scroll_y = 0;
     model.editing_profile = false;
     // The Edit profile sheet closes here too, and a picture on its way to the
     // avatar or banner has nowhere to land once it has: it would finish
@@ -43257,7 +43431,13 @@ fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     while (lines.next()) |line| {
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         // An empty value is meaningful: the user chose to load originals.
-        if (std.mem.eql(u8, line[0..eq], "media_proxy")) setMediaProxy(line[eq + 1 ..]);
+        // Anything that is not an address keeps the default. A value written
+        // before the field checked what it was given would otherwise send every
+        // uncached picture to a URL that goes nowhere.
+        if (std.mem.eql(u8, line[0..eq], "media_proxy")) {
+            const value = std.mem.trim(u8, line[eq + 1 ..], " \t\r\n");
+            if (value.len == 0 or isMediaProxyUrl(value)) setMediaProxy(value);
+        }
         if (std.mem.eql(u8, line[0..eq], "media_previews")) g_media_previews = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "show_sensitive")) g_show_sensitive = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "client_tag")) g_client_tag = std.mem.eql(u8, line[eq + 1 ..], "on");

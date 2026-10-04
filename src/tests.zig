@@ -4687,7 +4687,7 @@ test "the offline banner says what still works" {
     try testing.expect(banner.width > 100);
     // And it names what is waiting, when something is.
     model.outbox_pending = 3;
-    const text = main.offlineBannerTextForTest(arena, model.outbox_pending);
+    const text = main.offlineBannerTextForTest(arena, model.outbox_pending, false);
     try testing.expect(std.mem.indexOf(u8, text, "3 notes are") != null);
 }
 
@@ -10484,7 +10484,7 @@ test "every press on every screen can be reached and fired from the keyboard" {
     // different code: the composer, the notifications page, the profile editor,
     // the sheets that only open for somebody with a key. A guard that only ever
     // looked at the guest feed would pass with half the app unreachable.
-    const States = enum { feed, feed_no_reply_verb, thread, thread_nested, thread_no_reply_verb, own_profile, other_profile, bookmarks, settings, settings_editing, notifications, notifications_empty, composing, naming, address, joining, bunker, deleting, menu_scope, menu_relays, menu_account, relay_auth };
+    const States = enum { feed, feed_no_reply_verb, thread, thread_nested, thread_no_reply_verb, own_profile, other_profile, bookmarks, settings, settings_editing, notifications, notifications_empty, composing, naming, address, joining, bunker, deleting, menu_scope, menu_relays, menu_account, relay_auth, relays_paused };
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -10574,6 +10574,8 @@ test "every press on every screen can be reached and fired from the keyboard" {
             .menu_relays => model.menu = .relays,
             .menu_account => model.menu = .account,
             .relay_auth => {},
+            // The quiet strip with a Resume in it, in place of the offline one.
+            .relays_paused => model.relays_paused = true,
         }
         if (st == .notifications_empty) model.notifications_open = true;
 
@@ -10588,6 +10590,10 @@ test "every press on every screen can be reached and fired from the keyboard" {
         // rows that were already reachable.
         if ((st == .thread_nested or st == .thread_no_reply_verb) and countPressesOf(tree, tree.root, Msg{ .open_thread = 62 }) == 0) {
             std.debug.print("\nthe {s} screen drew no nested reply\n", .{f.name});
+            return error.ScreenNeverReached;
+        }
+        if (st == .relays_paused and countPressesOf(tree, tree.root, Msg.toggle_relays_paused) == 0) {
+            std.debug.print("\nthe {s} screen drew no Resume\n", .{f.name});
             return error.ScreenNeverReached;
         }
         if (auth_index) |i| {
@@ -31590,6 +31596,201 @@ test "a pressed hashtag opens the tag that was pressed, however many were drawn 
     main.beginViewBuildForTest();
     const fresh = main.contentSpans(&ui, "#fresh")[0].link;
     try testing.expectEqualStrings("fresh", main.topicLinkValueForTest(fresh) orelse return error.NoTopic);
+}
+
+// ---- settings, relays and signing in: the dead ends --------------------------
+
+fn findKind(widget: canvas.Widget, kind: canvas.WidgetKind) ?canvas.Widget {
+    if (widget.kind == kind) return widget;
+    for (widget.children) |child| {
+        if (findKind(child, kind)) |found| return found;
+    }
+    return null;
+}
+
+test "a relay address with a control byte, a space or a bad port is refused" {
+    // The address is written to the relays file one relay per line and sent in
+    // the handshake's request line, so a BEL in it was listed, counted, dialled
+    // and saved.
+    try testing.expect(!main.isRelayUrl("wss://relay.damus.io/\x07"));
+    try testing.expect(!main.isRelayUrl("wss://relay.damus.io/a\nb"));
+    try testing.expect(!main.isRelayUrl("wss://relay.damus.io/a b"));
+    try testing.expect(!main.isRelayUrl("wss://relay.damus.io\x7f"));
+    try testing.expect(!main.isRelayUrl("wss://relay.example.com:notaport"));
+    try testing.expect(main.isRelayUrl("wss://relay.damus.io/"));
+    try testing.expect(main.isRelayUrl("wss://relay.example.com:7447/path"));
+
+    // And through the Add press, which is the door the reader uses.
+    main.resetRelaysForTest();
+    defer main.resetRelaysForTest();
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    const before = main.relayCount();
+    model.relay_buffer.set("wss://relay.damus.io/\x07");
+    main.update(&model, .relay_add, &fx);
+    try testing.expectEqual(before, main.relayCount());
+    try testing.expect(model.relay_error);
+    try testing.expectEqualStrings("A relay address starts with wss:// and names a host.", model.relay_status());
+}
+
+test "the media proxy refuses what is not an address, and says why" {
+    const before = try testing.allocator.dupe(u8, main.mediaProxy());
+    defer testing.allocator.free(before);
+    defer main.setMediaProxy(before);
+
+    try testing.expect(!main.isMediaProxyUrl("not a url"));
+    try testing.expect(!main.isMediaProxyUrl("wsrv.nl"));
+    try testing.expect(!main.isMediaProxyUrl("ftp://wsrv.nl/"));
+    try testing.expect(!main.isMediaProxyUrl("https://"));
+    try testing.expect(!main.isMediaProxyUrl("https:///path"));
+    try testing.expect(!main.isMediaProxyUrl("https://wsrv.nl/\x07"));
+    try testing.expect(!main.isMediaProxyUrl("https://user@wsrv.nl/"));
+    try testing.expect(main.isMediaProxyUrl("https://wsrv.nl/"));
+    try testing.expect(main.isMediaProxyUrl("http://192.168.1.5:8080/img"));
+
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    main.setMediaProxy("https://wsrv.nl/");
+    model.proxy_buffer.set("not a url");
+    main.update(&model, .proxy_save, &fx);
+    // Nothing was saved, the old proxy still answers, and the field says why.
+    try testing.expect(!model.proxy_saved);
+    try testing.expect(model.proxy_invalid);
+    try testing.expectEqualStrings("https://wsrv.nl/", main.mediaProxy());
+    try testing.expect(std.mem.indexOf(u8, model.proxy_status(), "Not saved") != null);
+    try testing.expect(!std.mem.eql(u8, model.proxy_status(), "Saved."));
+
+    // Typing again is the reader answering, so the complaint goes.
+    model.proxy_buffer.set("https://proxy.example.org/");
+    main.update(&model, .proxy_save, &fx);
+    try testing.expect(model.proxy_saved and !model.proxy_invalid);
+    try testing.expectEqualStrings("https://proxy.example.org/", main.mediaProxy());
+    try testing.expectEqualStrings("Saved.", model.proxy_status());
+
+    // Empty stays a choice: load originals.
+    model.proxy_buffer.set("");
+    main.update(&model, .proxy_save, &fx);
+    try testing.expect(model.proxy_saved and !model.proxy_invalid);
+    try testing.expectEqual(@as(usize, 0), main.mediaProxy().len);
+}
+
+test "the last relay cannot be removed, and the press says why" {
+    main.resetRelaysForTest();
+    defer main.resetRelaysForTest();
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+
+    // Down to one by the same function the button calls.
+    var i: usize = 0;
+    while (main.relayCount() > 1) : (i += 1) {
+        if (main.relayAt(i) != null) main.removeRelayForTest(i);
+    }
+    var last: usize = 0;
+    while (main.relayAt(last) == null) : (last += 1) {}
+
+    main.update(&model, Msg{ .relay_remove = @intCast(last) }, &fx);
+    try testing.expectEqual(@as(usize, 1), main.relayCount());
+    try testing.expect(model.relay_last);
+    try testing.expect(std.mem.indexOf(u8, model.relay_status(), "at least one relay") != null);
+
+    // Adding another is what makes room, and the complaint goes with it.
+    model.relay_buffer.set("wss://relay.example.com");
+    main.update(&model, .relay_add, &fx);
+    try testing.expectEqual(@as(usize, 2), main.relayCount());
+    try testing.expect(!model.relay_last);
+    main.update(&model, Msg{ .relay_remove = @intCast(last) }, &fx);
+    try testing.expectEqual(@as(usize, 1), main.relayCount());
+}
+
+test "a paused pool is not worded or coloured as a failure" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+
+    // No relay is up in a test. Not paused: the amber failure strip.
+    const down = try painted.Painted.render(arena, &model);
+    try testing.expect(down.fillRectOf(theme.palette.surface_offline) != null);
+    try testing.expect(down.frameOf("Resume relays") == null);
+
+    // Paused: the same silence, but it is the reader's doing, so it is not amber
+    // and it carries the way back.
+    model.relays_paused = true;
+    const paused = try painted.Painted.render(arena, &model);
+    try testing.expect(paused.fillRectOf(theme.palette.surface_offline) == null);
+    try testing.expect(paused.frameOf("Resume relays") != null);
+    try testing.expect(std.mem.indexOf(u8, main.pausedBannerTextForTest(arena, 0), "paused") != null);
+    try testing.expect(std.mem.indexOf(u8, main.pausedBannerTextForTest(arena, 2), "2 notes are waiting") != null);
+
+    // And a list with nobody in it is not "no relay is answering".
+    const none = main.offlineBannerTextForTest(arena, 0, true);
+    try testing.expect(std.mem.indexOf(u8, none, "No relays are set up") != null);
+    try testing.expect(std.mem.indexOf(u8, none, "answering") == null);
+}
+
+test "the relay list note sits under its field instead of spilling out of it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetRelaysForTest();
+    main.forgetOwnRecordAnswersForTest();
+    main.setIdentityForTest([_]u8{81} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    // A list this account has not been read back from: the note is showing.
+    const note = main.relayWriteBlockedReason() orelse return error.NoNote;
+
+    // The narrowest window the app allows, where the note wraps the most.
+    const p = try painted.Painted.renderAt(arena, &model, 880, 1600);
+    const field = p.frameOf("Add a relay") orelse return error.NoField;
+    const note_frame = frameOfText(p, note) orelse return error.NoNoteFrame;
+    const next = frameOfText(p, "APPEARANCE") orelse return error.NoNextSection;
+    // Below the field, not drawn over it, and clear of the next heading.
+    try testing.expect(note_frame.y >= field.y + field.height - 0.5);
+    try testing.expect(note_frame.y + note_frame.height <= next.y);
+}
+
+test "asking to log out brings the question into view" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    model.stage = .settings;
+    // The reader has scrolled to the foot of the page to find the button.
+    main.update(&model, Msg{ .settings_scrolled = .{ .offset_y = 120, .viewport_extent_y = 500, .content_extent_y = 620 } }, &fx);
+    try testing.expectEqual(@as(f32, 120), model.settings_scroll_y);
+
+    main.update(&model, .logout_request, &fx);
+    try testing.expect(model.logout_pending);
+    try testing.expectEqual(main.settings_scroll_end, model.settings_scroll_y);
+    // And the scroll view is told, which is what moves the page.
+    const tree = try buildTree(arena, &model);
+    const scroll = findKind(tree.root, .scroll_view) orelse return error.NoScroll;
+    try testing.expectEqual(main.settings_scroll_end, scroll.value);
+
+    // Reopening Settings starts at the top, not where the last visit asked for.
+    main.update(&model, .close_settings, &fx);
+    main.update(&model, .open_settings, &fx);
+    try testing.expectEqual(@as(f32, 0), model.settings_scroll_y);
+}
+
+test "copying the npub says it was copied" {
+    var model = main.initialModel();
+    var fx: main.EffectsForTest = undefined;
+    main.recordingEffectsForTest(&fx, testing.allocator);
+    defer fx.deinit();
+    main.setIdentityForTest([_]u8{82} ** 32);
+    defer main.clearIdentityForTest();
+    main.update(&model, .copy_npub, &fx);
+    try testing.expectEqualStrings("npub copied", model.toast_text());
 }
 
 test "a bunker link signs the reader in when the signer answers, not before" {
