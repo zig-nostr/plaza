@@ -1010,6 +1010,85 @@ test "a write after a list published but not stored builds on what went out" {
     try testing.expect(!main.heldOwnRecordForTest(10000));
 }
 
+fn bunkerAnswerLands(ev: nostr.event.Event, signer: nostr.keys.Signer) void {
+    main.ingestAndPublishVerifiedForTest(std.heap.page_allocator, ev, signer);
+}
+
+test "a bunker's mute the store refused still goes out, and the next mute builds on it" {
+    // The bunker's door returned on a store error: the signed list was neither
+    // stored nor published, its undo was already released, and the screen
+    // showed a mute that never went out.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fs: FreshStore = undefined;
+    try fs.open("bunker-unstored");
+    defer fs.close();
+    main.setIdentityForTest([_]u8{0x90} ** 32);
+    defer main.clearIdentityForTest();
+    main.setIdentityMintedForTest(true);
+    defer main.setIdentityMintedForTest(false);
+    defer main.forgetMutesForTest();
+    defer main.failIngestForTest(false);
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x90} ** 32);
+    const first = [_]u8{0xf6} ** 32;
+    const second = [_]u8{0xf7} ** 32;
+    const first_hex = std.fmt.bytesToHex(first, .lower);
+    const tags = [_]nostr.event.Tag{&.{ "p", &first_hex }};
+    const signed = try nostr.event.create(arena, signer, kp, 1_900_000_000, 10000, &tags, "", null);
+
+    // The answer lands on the listener's thread, as it does live.
+    main.failIngestForTest(true);
+    const listener = try std.Thread.spawn(.{}, bunkerAnswerLands, .{ signed, signer });
+    listener.join();
+    main.failIngestForTest(false);
+
+    // Before any tick, the next mute builds on what went out.
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(main.MuteWrite.published, main.writeMuteForTest(&fx, second, true));
+    const next = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expect(publishedNames(next, first));
+    try testing.expect(publishedNames(next, second));
+    try testing.expect(next.created_at > signed.created_at);
+}
+
+test "a bunker's note the store refused still goes out, and a forged one never does" {
+    defer main.resetOutboxForTest();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fs: FreshStore = undefined;
+    try fs.open("bunker-unstored-note");
+    defer fs.close();
+    main.setIdentityForTest([_]u8{0x91} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.failIngestForTest(false);
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x91} ** 32);
+    const note = try nostr.event.create(arena, signer, kp, 1_900_000_000, 1, &.{}, "kept", null);
+    var forged = try nostr.event.create(arena, signer, kp, 1_900_000_001, 1, &.{}, "signed", null);
+    forged.content = "changed";
+
+    // Queued to go out, though the store failed.
+    main.failIngestForTest(true);
+    const listener = try std.Thread.spawn(.{}, bunkerAnswerLands, .{ note, signer });
+    listener.join();
+    try testing.expect(main.outboxStateForTest(note.id) != null);
+
+    // A signature that does not hold goes nowhere, whether the store failed
+    // before it checked or checked and refused it.
+    bunkerAnswerLands(forged, signer);
+    try testing.expect(main.outboxStateForTest(forged.id) == null);
+    main.failIngestForTest(false);
+    bunkerAnswerLands(forged, signer);
+    try testing.expect(main.outboxStateForTest(forged.id) == null);
+}
+
 test "a list published but not stored is offered to the store until it is in, and never let go before" {
     // Letting the hold go after a few tries made the next write splice onto the
     // older stored list, and take the reader's last change back on every relay.

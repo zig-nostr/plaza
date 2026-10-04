@@ -18,6 +18,7 @@ const geometry = native_sdk.geometry;
 
 // ---- from main.zig
 const noteOwnWriteUnstored = main.noteOwnWriteUnstored;
+const noteOwnWriteUnstoredOffThread = main.noteOwnWriteUnstoredOffThread;
 const notePrivateBookmarkPublished = main.notePrivateBookmarkPublished;
 const postWaitsForPicture = main.postWaitsForPicture;
 const AppUi = main.AppUi;
@@ -1355,12 +1356,25 @@ pub fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?
     }
     if (main.g_store == null) return;
     if (verify) |signer| {
-        // A note we did not produce: verification is the gate into the store
-        // AND the pool, so a bad signature is dropped rather than propagated.
-        // `.invalid` is the result that says so, not an error, and it used to
-        // be ignored here and the event published anyway.
-        const result = plazaIngest(gpa, ev, .{ .verify_with = signer }) catch return;
-        if (result == .invalid) return;
+        // A note a bunker signed: verification is the gate into the store AND
+        // the pool, so a bad signature is dropped rather than propagated.
+        const stored = if (plazaIngest(gpa, ev, .{ .verify_with = signer })) |result| switch (result) {
+            .added, .replaced, .duplicate, .stale => true,
+            else => false,
+        } else |_| false;
+        if (!stored) {
+            // The store refused it or failed before it checked anything, so
+            // the signature is checked here. A bad one is not published, and
+            // `.invalid` lands here too. A good one goes out anyway, the way a
+            // Notary write the store refused does: returning dropped a mute or
+            // a follow the press had already shown, whose undo the listener
+            // releases on the signature, with nothing stored, nothing sent
+            // and nothing said. And it is held, so the next write of its kind
+            // builds on it. The hold is the UI thread's and this runs on the
+            // bunker listener, so it goes by the inbox the hold reads first.
+            if (!(nostr.event.verify(gpa, signer, ev) catch false)) return;
+            noteOwnWriteUnstoredOffThread(ev);
+        }
     } else {
         // A note we just signed: a store failure (e.g. a duplicate id) must not
         // stop it reaching the pool. But the store is now behind what went
@@ -1486,6 +1500,10 @@ pub fn holdPostForTest(now_s: i64) void {
 }
 pub fn ingestAndPublishForTest(gpa: std.mem.Allocator, ev: nostr.event.Event) void {
     ingestAndPublish(gpa, ev, null, .none);
+}
+/// The bunker's door: an event signed elsewhere, checked on the way in.
+pub fn ingestAndPublishVerifiedForTest(gpa: std.mem.Allocator, ev: nostr.event.Event, signer: nostr.keys.Signer) void {
+    ingestAndPublish(gpa, ev, signer, .none);
 }
 pub fn notifiedByForTest(content: []const u8, out: *[max_mention_tags][32]u8) usize {
     return notifiedBy(content, out);

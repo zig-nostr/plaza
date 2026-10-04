@@ -222,8 +222,9 @@ var g_unstored_at: [self_filter_kinds.len]std.atomic.Value(i64) = @splat(std.ato
 ///
 /// Owned, and touched on the UI thread only: it is set by `ingestAndPublish`
 /// for a record this process signed (the keyholder's answer, handled in
-/// `update`; a bunker's answer goes through the verified branch, which never
-/// holds), and read by the tick and by the writes, which all run from `update`.
+/// `update`), taken from the bunker listener's inbox (see
+/// `noteOwnWriteUnstoredOffThread`), and read by the tick and by the writes,
+/// which all run from `update`.
 var g_unstored_copy: [self_filter_kinds.len]?nostr.event.Event = @splat(null);
 var g_unstored_tries: [self_filter_kinds.len]u8 = @splat(0);
 var g_unstored_retry_at: [self_filter_kinds.len]i64 = @splat(0);
@@ -248,22 +249,94 @@ fn selfKindIndex(kind: u16) ?usize {
 
 /// Records that the reader's own `ev` was published without being stored.
 pub fn noteOwnWriteUnstored(ev: nostr.event.Event) void {
-    const i = selfKindIndex(ev.kind) orelse return;
-    const me = activePubkey() orelse return;
-    if (!std.mem.eql(u8, &me, &ev.pubkey)) return;
+    if (selfKindIndex(ev.kind) == null) return;
+    holdOwnWrite(ev.pubkey, ev.kind, ev.created_at, dupeEventForPublish(ev));
+}
+
+/// The hold itself. Takes `copy` (null when none could be made) and frees it
+/// when it is not the one kept. UI thread.
+fn holdOwnWrite(pubkey: [32]u8, kind: u16, created_at: i64, copy: ?nostr.event.Event) void {
+    const i = selfKindIndex(kind) orelse return freeHeldCopy(copy);
+    const me = activePubkey() orelse return freeHeldCopy(copy);
+    if (!std.mem.eql(u8, &me, &pubkey)) return freeHeldCopy(copy);
     if (g_unstored_for) |who| {
         if (!std.mem.eql(u8, &who, &me)) forgetOwnWritesUnstored();
     }
     g_unstored_for = me;
-    _ = g_unstored_at[i].fetchMax(ev.created_at, .acq_rel);
+    _ = g_unstored_at[i].fetchMax(created_at, .acq_rel);
     // The newest record of the kind is the one to store and to build on. One
     // that cannot be copied still holds, and refuses the writes of its kind
     // until a relay sends it back.
     if (g_unstored_copy[i]) |held| {
-        if (held.created_at > ev.created_at) return;
+        if (held.created_at > created_at) return freeHeldCopy(copy);
     }
     dropUnstoredCopy(i);
-    g_unstored_copy[i] = dupeEventForPublish(ev);
+    g_unstored_copy[i] = copy;
+}
+
+fn freeHeldCopy(copy: ?nostr.event.Event) void {
+    if (copy) |c| freePublishedEvent(c);
+}
+
+/// Records the bunker listener published and the store refused, on their way
+/// to the hold, which belongs to the UI thread. One per kind, the newest.
+///
+/// The listener leaves a record here before its sign stops counting as
+/// landing (`listWriteInFlight`), and every reader of the hold takes the inbox
+/// in first. So a write of that kind either waits for the sign or builds on
+/// this record, and never splices onto the older one in the store.
+const UnstoredArrival = struct {
+    pubkey: [32]u8,
+    kind: u16,
+    created_at: i64,
+    copy: ?nostr.event.Event,
+};
+var g_unstored_inbox: [self_filter_kinds.len]?UnstoredArrival = @splat(null);
+var g_unstored_inbox_lock = std.atomic.Value(bool).init(false);
+/// Set under the lock with the slot, so an empty inbox costs a load, not a lock.
+var g_unstored_inbox_full = std.atomic.Value(bool).init(false);
+
+fn lockUnstoredInbox() void {
+    while (g_unstored_inbox_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+
+fn unlockUnstoredInbox() void {
+    g_unstored_inbox_lock.store(false, .release);
+}
+
+/// `noteOwnWriteUnstored` for a thread that is not the UI's. The copy is made
+/// and freed outside the lock; nothing called under it takes a lock.
+pub fn noteOwnWriteUnstoredOffThread(ev: nostr.event.Event) void {
+    const i = selfKindIndex(ev.kind) orelse return;
+    var arrival: UnstoredArrival = .{ .pubkey = ev.pubkey, .kind = ev.kind, .created_at = ev.created_at, .copy = dupeEventForPublish(ev) };
+    lockUnstoredInbox();
+    if (g_unstored_inbox[i]) |waiting| {
+        // The older of the two is the one let go.
+        if (waiting.created_at <= ev.created_at) {
+            g_unstored_inbox[i] = arrival;
+            arrival = waiting;
+        }
+    } else {
+        g_unstored_inbox[i] = arrival;
+        arrival.copy = null;
+    }
+    g_unstored_inbox_full.store(true, .release);
+    unlockUnstoredInbox();
+    freeHeldCopy(arrival.copy);
+}
+
+/// Moves whatever the listener left into the hold. UI thread. A record of an
+/// account no longer signed in is let go by `holdOwnWrite`.
+fn takeUnstoredInbox() void {
+    if (!g_unstored_inbox_full.load(.acquire)) return;
+    lockUnstoredInbox();
+    const taken = g_unstored_inbox;
+    g_unstored_inbox = @splat(null);
+    g_unstored_inbox_full.store(false, .release);
+    unlockUnstoredInbox();
+    for (taken) |slot| {
+        if (slot) |a| holdOwnWrite(a.pubkey, a.kind, a.created_at, a.copy);
+    }
 }
 
 /// A record of the reader's own, of `kind` and stamped `created_at`, is in the
@@ -281,6 +354,7 @@ pub fn noteOwnRecordStored(pubkey: [32]u8, kind: u16, created_at: i64) void {
 /// store has a record of that kind at least as new.
 pub fn retryUnstoredOwnWrites(now: i64) void {
     const gpa = std.heap.page_allocator;
+    takeUnstoredInbox();
     for (&g_unstored_at, 0..) |*at, i| {
         if (at.load(.acquire) == 0) {
             // Read back, by a relay or by an earlier try. Offered once more
@@ -314,6 +388,7 @@ pub fn retryUnstoredOwnWrites(now: i64) void {
 /// signed in now. Owned by the hold: copy what outlives the call. UI thread.
 pub fn heldOwnRecord(kind: u16) ?nostr.event.Event {
     const i = selfKindIndex(kind) orelse return null;
+    takeUnstoredInbox();
     const me = activePubkey() orelse return null;
     const who = g_unstored_for orelse return null;
     if (!std.mem.eql(u8, &who, &me)) return null;
@@ -325,6 +400,7 @@ pub fn heldOwnRecord(kind: u16) ?nostr.event.Event {
 /// one is held and there is no copy of it to build on.
 pub fn ownWriteUnstored(kind: u16) bool {
     const i = selfKindIndex(kind) orelse return false;
+    takeUnstoredInbox();
     const me = activePubkey() orelse return false;
     const who = g_unstored_for orelse return false;
     if (!std.mem.eql(u8, &who, &me)) return false;
