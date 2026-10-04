@@ -14061,6 +14061,249 @@ test "pressing a hashtag opens what this machine already holds for it" {
     try testing.expect(!model.levelOpen());
 }
 
+test "a hashtag asks for the lowercase t tag, kind 1, and nothing else" {
+    var model = main.initialModel();
+    model.stage = .ready;
+    // The page is reached from text the reader typed or pasted, and a relay
+    // matches `t` values exactly. Published tags are lowercase (NIP-24), so
+    // `#PlanetDyne` asked for as written finds nothing at all.
+    main.openTopicForTest(&model, "PlanetDyne");
+    try testing.expectEqualStrings("planetdyne", model.viewingTopic() orelse return error.NoTopic);
+
+    const req = try main.topicReqForTest(testing.allocator, "planetdyne");
+    defer testing.allocator.free(req);
+    try testing.expect(std.mem.startsWith(u8, req, "[\"REQ\",\"plaza-topic\",{"));
+    try testing.expect(std.mem.indexOf(u8, req, "\"kinds\":[1]") != null);
+    try testing.expect(std.mem.indexOf(u8, req, "\"#t\":[\"planetdyne\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, req, "\"limit\":") != null);
+    // No author scope: a tag belongs to nobody.
+    try testing.expect(std.mem.indexOf(u8, req, "\"authors\"") == null);
+}
+
+fn ingestTopicNotes(arena: std.mem.Allocator, store: *nostr.store.Store, signer: nostr.keys.Signer) !void {
+    main.setStoreForTest(store);
+    const kp = try signer.keyPairFromSecretKey([_]u8{45} ** 32);
+    const tag = [_]nostr.event.Tag{&.{ "t", "planetdyne" }};
+    const other = [_]nostr.event.Tag{&.{ "t", "bitcoin" }};
+    _ = try main.plazaIngestForTest(arena, try nostr.event.create(arena, signer, kp, 1_800_000_011, 1, &tag, "first light", null));
+    _ = try main.plazaIngestForTest(arena, try nostr.event.create(arena, signer, kp, 1_800_000_012, 1, &tag, "second light", null));
+    _ = try main.plazaIngestForTest(arena, try nostr.event.create(arena, signer, kp, 1_800_000_013, 1, &other, "something else", null));
+}
+
+test "what a hashtag's relays send reaches its page" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/arrive.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    defer main.setStoreForTest(null);
+
+    // Opened on an empty store: nothing here yet, and the page is waiting.
+    main.setStoreForTest(&store);
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.openTopicForTest(&model, "planetdyne");
+    try testing.expectEqual(@as(usize, 0), model.thread_notes_len);
+    try testing.expect(model.thread_loading);
+
+    // The fetch's worker ingests into the store and tells no one. The tick is
+    // the only thing that can carry it to the screen.
+    try ingestTopicNotes(arena, &store, signer);
+    main.forgetLevelCountForTest();
+    main.refreshOpenLevelForTest(&model, 1_800_000_100);
+    try testing.expectEqual(@as(usize, 2), model.thread_notes_len);
+    try testing.expect(!model.thread_loading);
+    for (model.thread_notes[0..model.thread_notes_len]) |note| {
+        if (std.mem.indexOf(u8, note.content(), "something else") != null) return error.WrongNotesInTopic;
+    }
+
+    // And they are drawn.
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findAnyTextContainingText(tree.root, "first light") != null);
+    try testing.expect(findAnyTextContainingText(tree.root, "second light") != null);
+}
+
+test "a hashtag nobody has used says so instead of looking for ever" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.resetProfilesForTest();
+    // The finished generation below is a made-up one far ahead of the real
+    // counter, so put it back for whatever runs next.
+    defer main.finishLevelFetchForTest(0);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.openTopicForTest(&model, "unusedtag");
+    // A fetch that has not come back. With no relays in a test the real one is
+    // marked finished on the spot, which would hide the wait.
+    model.thread_seq += 1000;
+    const opened = model.thread_open_at;
+
+    // Waiting, in words that are about a tag. "What they have written" is a
+    // person's sentence, and it was the one shown here.
+    main.refreshOpenLevelForTest(&model, opened + 1);
+    try testing.expect(model.thread_loading);
+    const waiting = try buildTree(arena, &model);
+    try testing.expect(findAnyText(waiting.root, "Looking for notes with this tag…") != null);
+    try testing.expect(findAnyTextContainingText(waiting.root, "what they have written") == null);
+    try testing.expect(findAnyText(waiting.root, "No notes with this tag yet.") == null);
+
+    // Every relay answered with nothing.
+    main.finishLevelFetchForTest(model.thread_seq);
+    main.refreshOpenLevelForTest(&model, opened + 2);
+    try testing.expect(!model.thread_loading);
+    const answered = try buildTree(arena, &model);
+    try testing.expect(findAnyText(answered.root, "No notes with this tag yet.") != null);
+    try testing.expect(findAnyText(answered.root, "Looking for notes with this tag…") == null);
+
+    // Or a relay never sent its EOSE, which is the case that left the line up
+    // for ever: the wait ends on its own.
+    main.openTopicForTest(&model, "unusedtoo");
+    model.thread_seq += 1000;
+    const again = model.thread_open_at;
+    main.refreshOpenLevelForTest(&model, again + 1);
+    try testing.expect(model.thread_loading);
+    main.refreshOpenLevelForTest(&model, again + 60);
+    try testing.expect(!model.thread_loading);
+    const timed_out = try buildTree(arena, &model);
+    try testing.expect(findAnyText(timed_out.root, "No notes with this tag yet.") != null);
+}
+
+test "a hashtag page can be left, and the mark goes home from every page" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.clearIdentityForTest();
+    var fx: main.EffectsForTest = undefined;
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.openTopicForTest(&model, "planetdyne");
+    try testing.expect(model.levelOpen());
+
+    // A way back, the same control a thread and a person's page carry.
+    const topic_tree = try buildTree(arena, &model);
+    const back = pressMsgByLabel(topic_tree, "Back") orelse return error.TopicHasNoBack;
+    switch (back) {
+        .close_thread => {},
+        else => return error.BackGoesSomewhereElse,
+    }
+    main.update(&model, back, &fx);
+    try testing.expect(!model.levelOpen());
+    try testing.expect(model.viewingTopic() == null);
+
+    // The mark is on the page, and it leaves it. It used to clear a person and a
+    // thread and nothing else, so the page stayed exactly where it was.
+    main.openTopicForTest(&model, "planetdyne");
+    const home = pressMsgByLabel(try buildTree(arena, &model), "Home") orelse return error.NoMark;
+    main.update(&model, home, &fx);
+    try testing.expect(!model.levelOpen());
+    try testing.expectEqual(@as(usize, 0), model.thread_stack_len);
+
+    // Two pages deep, which is the case a reader reaches: a hashtag opened from
+    // a person's page.
+    main.enterProfileForTest(&model, [_]u8{0x2B} ** 32);
+    main.openTopicForTest(&model, "zig");
+    try testing.expect(model.thread_stack_len > 0);
+    main.update(&model, .go_home, &fx);
+    try testing.expect(!model.levelOpen());
+    try testing.expectEqual(@as(usize, 0), model.thread_stack_len);
+
+    // The bookmark list is the other page with the same hole.
+    main.openBookmarksForTest(&model);
+    const bm_tree = try buildTree(arena, &model);
+    try testing.expect(pressMsgByLabel(bm_tree, "Back") != null);
+    main.update(&model, .go_home, &fx);
+    try testing.expect(!model.levelOpen());
+
+    // Signing out leaves every kind of level too. A topic left set would be
+    // the page the next account lands on.
+    main.openTopicForTest(&model, "planetdyne");
+    main.performLogoutForTest(&model, &fx);
+    try testing.expect(model.viewingTopic() == null);
+    try testing.expect(!model.levelOpen());
+    main.openBookmarksForTest(&model);
+    main.performLogoutForTest(&model, &fx);
+    try testing.expect(!model.levelOpen());
+}
+
+test "a muted person's note is not on a hashtag page" {
+    const me = [_]u8{0x46} ** 32;
+    main.setIdentityForTest(me);
+    defer {
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/mutetopic.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+
+    const loud = try signer.keyPairFromSecretKey([_]u8{0x47} ** 32);
+    const fine = try signer.keyPairFromSecretKey([_]u8{0x48} ** 32);
+    const tag = [_]nostr.event.Tag{&.{ "t", "planetdyne" }};
+    _ = try main.plazaIngestForTest(arena, try nostr.event.create(arena, signer, loud, 1_800_000_021, 1, &tag, "from the muted one", null));
+    _ = try main.plazaIngestForTest(arena, try nostr.event.create(arena, signer, fine, 1_800_000_022, 1, &tag, "from the other one", null));
+    const muted = [_][32]u8{loud.public_key};
+    try testing.expect(main.setMutesForTest(&muted, 1_800_000_000));
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.openTopicForTest(&model, "planetdyne");
+    try testing.expectEqual(@as(usize, 1), model.thread_notes_len);
+    try testing.expectEqualStrings("from the other one", model.thread_notes[0].content());
+
+    // And the same when the notes arrive after the page is open.
+    _ = try main.plazaIngestForTest(arena, try nostr.event.create(arena, signer, loud, 1_800_000_023, 1, &tag, "muted, later", null));
+    main.forgetLevelCountForTest();
+    main.refreshOpenLevelForTest(&model, 1_800_000_100);
+    try testing.expectEqual(@as(usize, 1), model.thread_notes_len);
+    try testing.expectEqualStrings("from the other one", model.thread_notes[0].content());
+}
+
+test "a note pressed on a hashtag page opens, and Back returns to the page" {
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.openTopicForTest(&model, "planetdyne");
+
+    // The topic was set aside on the stack but also left set, and a topic
+    // outranks a thread when the view is built: the press opened nothing.
+    var root = main.Note{};
+    root.id = 0xBB;
+    main.enterThreadForTest(&model, root);
+    try testing.expect(model.viewingTopic() == null);
+    try testing.expectEqual(@as(i64, 0xBB), model.viewing_thread);
+
+    main.closeThreadForTest(&model);
+    try testing.expectEqualStrings("planetdyne", model.viewingTopic() orelse return error.TopicLost);
+    try testing.expectEqual(@as(i64, 0), model.viewing_thread);
+
+    // The same from a person's face on a note there.
+    main.enterProfileForTest(&model, [_]u8{0x2C} ** 32);
+    try testing.expect(model.viewingTopic() == null);
+    try testing.expect(model.viewing_profile != null);
+    main.closeThreadForTest(&model);
+    try testing.expectEqualStrings("planetdyne", model.viewingTopic() orelse return error.TopicLost);
+    main.closeThreadForTest(&model);
+    try testing.expect(!model.levelOpen());
+}
+
 fn bookmarkFixture(
     arena: std.mem.Allocator,
     signer: *nostr.keys.Signer,
@@ -14076,6 +14319,49 @@ fn bookmarkFixture(
     _ = try main.plazaIngestVerifiedForTest(arena, ev, signer.*);
     main.loadBookmarksFromStoreForTest();
     return kp;
+}
+
+test "an empty bookmark list says whether anything is saved" {
+    main.forgetBookmarksForTest();
+    defer {
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bmempty.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    // One bookmark, for a note this machine never fetched. The list shows
+    // nothing, and "nothing saved" would be wrong about why.
+    var unfetched_hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&unfetched_hex, "{x}", .{[_]u8{0xa7} ** 32});
+    const saved = [_]nostr.event.Tag{&.{ "e", &unfetched_hex }};
+    _ = try bookmarkFixture(arena, &signer, &store, &saved, "");
+    try testing.expectEqual(@as(usize, 1), main.bookmarkCount());
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.openBookmarksForTest(&model);
+    try testing.expectEqual(@as(usize, 0), model.thread_notes_len);
+    const held = try buildTree(arena, &model);
+    try testing.expect(findAnyText(held.root, "None of your saved notes are on this machine yet.") != null);
+    try testing.expect(findAnyText(held.root, "Nothing saved here yet.") == null);
+    try testing.expect(findAnyTextContainingText(held.root, "they have written") == null);
+
+    // And with none at all, it says that.
+    main.forgetBookmarksForTest();
+    try testing.expectEqual(@as(usize, 0), main.bookmarkCount());
+    const none = try buildTree(arena, &model);
+    try testing.expect(findAnyText(none.root, "Nothing saved here yet.") != null);
 }
 
 test "a bookmark splices onto the list and never publishes over an unreadable half" {

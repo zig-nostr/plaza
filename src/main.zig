@@ -12880,22 +12880,37 @@ pub const Model = struct {
     fn refreshTopicNotes(self: *Model, now_s: i64) void {
         const topic = self.viewingTopic() orelse return;
         const store = g_store orelse return;
-        const kinds = [_]u16{1};
         const values = [_][]const u8{topic};
-        const tags = [_]nostr.filter.TagFilter{.{ .letter = 't', .values = &values }};
-        var result = store.query(std.heap.page_allocator, .{
-            .kinds = &kinds,
-            .tags = &tags,
-            .limit = thread_reply_cap,
-        }) catch return;
+        var tags: [1]nostr.filter.TagFilter = undefined;
+        var result = store.query(std.heap.page_allocator, topicFilter(&values, &tags)) catch return;
         defer result.deinit();
         var n: usize = 0;
         for (result.events) |ev| {
             if (n >= self.thread_notes.len) break;
+            // A tag is written under by strangers, and a muted one is hidden
+            // here the way the feed and a thread hide them. Jumble's note list
+            // does the same for its hashtag page
+            // (src/components/NoteList/index.tsx:147).
+            if (isMuted(ev.pubkey)) continue;
             self.thread_notes[n] = noteFrom(ev, now_s);
+            // Queue the author's profile so a name and a face resolve for a
+            // stranger, which is most of who writes under a tag.
+            wantProfile(ev.pubkey);
             n += 1;
         }
         self.thread_notes_len = n;
+    }
+
+    /// Ends the topic's loading line. A topic is done waiting when something is
+    /// on screen, when its fetch has asked every relay and come back, or when
+    /// it has been long enough that a relay holding its EOSE back is no reason
+    /// to keep the reader looking at a spinner. The same three exits a thread
+    /// has. Without the last two a tag nobody has used was "looking" for ever.
+    fn settleTopicLoading(self: *Model, now_s: i64) void {
+        if (self.topic_len == 0 or !self.thread_loading) return;
+        const done = g_thread_done_seq.load(.acquire) >= self.thread_seq;
+        const timed_out = now_s - self.thread_open_at > thread_loading_grace_s;
+        if (self.thread_notes_len > 0 or done or timed_out) self.thread_loading = false;
     }
 
     fn refreshProfileNotes(self: *Model, now_s: i64) void {
@@ -26262,6 +26277,14 @@ fn personAvatar(ui: *AppUi, pubkey: [32]u8, size: f32) AppUi.Node {
 
 /// The 44px band above a person: Back, and who this is.
 fn profileHeaderBand(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
+    return levelBand(ui, model, elide(ui, personName(ui, pubkey), profile_band_name_max));
+}
+
+/// The strip across the top of a stacked list level: Back, naming where it
+/// lands, and what this level is. Every level that sits over the feed owes the
+/// reader a way off it, and a topic and the bookmark list went without one
+/// because only a person's page had this band.
+fn levelBand(ui: *AppUi, model: *const Model, title: []const u8) AppUi.Node {
     const p = theme.palette;
     const back_label = if (model.thread_stack_len > 0)
         model.thread_stack[model.thread_stack_len - 1].backLabel()
@@ -26273,7 +26296,7 @@ fn profileHeaderBand(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node
             ui.spacer(1),
             ui.paragraph(
                 .{ .style = .{ .foreground = p.text_primary } },
-                &.{.{ .text = elide(ui, personName(ui, pubkey), profile_band_name_max), .weight = .medium, .scale = menu_scale }},
+                &.{.{ .text = title, .weight = .medium, .scale = menu_scale }},
             ),
             ui.spacer(1),
             hgap(ui, 48),
@@ -26600,7 +26623,15 @@ fn profileEmptyRow(ui: *AppUi, rows: *const ProfileRows) AppUi.Node {
     // new reader is most likely to see first, and "Nothing they have written" is
     // the app talking about them behind their back on their own page.
     const mine = isMe(rows.subject());
-    const text: []const u8 = if (rows.loading)
+    // A tag and the bookmark list are about no person, so the sentences below
+    // about what somebody "has written" are not theirs to say.
+    const text: []const u8 = if (rows.header == .topic)
+        if (rows.loading) "Looking for notes with this tag…" else "No notes with this tag yet."
+    else if (rows.header == .bookmarks)
+        // Saved but never fetched is not the same as nothing saved, and the
+        // card above already says those are not listed.
+        if (bookmarkCount() == 0) "Nothing saved here yet." else "None of your saved notes are on this machine yet."
+    else if (rows.loading)
         if (mine) "Looking for what you have written…" else "Looking for what they have written…"
     else if (rows.model.profile_tab == .replies)
         if (mine) "Nothing you have written at anyone is here yet." else "Nothing they have written at anyone is here yet."
@@ -26716,12 +26747,12 @@ fn profilePanel(
         break :blk built;
     };
     return ui.column(.{ .grow = 1, .style_tokens = .{ .background = .background } }, .{
-        // The band only means something over a person: it is their name and
-        // their follow button. A topic and a bookmark list carry their own
-        // header as the first row instead.
+        // Back is the same for every kind of level; what the band names is
+        // not. The header row under it still says what the list is.
         if (occluded) ui.spacer(0) else switch (header) {
             .person => |pk| profileHeaderBand(ui, model, pk),
-            else => ui.spacer(0),
+            .topic => |t| levelBand(ui, model, elide(ui, ui.fmt("#{s}", .{t}), profile_band_name_max)),
+            .bookmarks => levelBand(ui, model, "Bookmarks"),
         },
         ui.virtualList(options, window, .{rows}),
     });
@@ -33252,6 +33283,56 @@ fn setPlain(comptime capacity: usize, buffer: *canvas.TextBuffer(capacity), text
     buffer.set(plainLineBreaks(text, &scratch).text);
 }
 
+/// Keeps the open level current, once a tick: what a backfill has since put in
+/// the store, the loading line, and the relative times.
+///
+/// Every kind of level a fetch fills has to be named here (the bookmark list
+/// fires no fetch, so it has nothing to hear). The store-moved guard below skips
+/// the read when nothing arrived, which is right, but it means a level that is
+/// left out never hears about its own fetch: the topic view was, so what its
+/// relays sent was ingested and then never drawn, and its loading line never
+/// ended.
+fn refreshOpenLevel(model: *Model, now: i64) void {
+    const level_count = if (g_store) |st| (st.eventCount() catch g_last_level_count) else g_last_level_count;
+    if (level_count != g_last_level_count) {
+        g_last_level_count = level_count;
+        model.refreshThreadNotes(now);
+        // And the open person's notes, for the same reason and with
+        // the same consequence if it is missed: without this the
+        // backfill this screen fires never appears, and the quiet
+        // line saying they have written nothing stays up over a
+        // store that has since filled with their notes.
+        model.refreshProfileNotes(now);
+        model.refreshTopicNotes(now);
+    }
+    // Relative times were a side effect of the rebuild, so they have
+    // to be kept up now that the rebuild is conditional. "2m" going
+    // stale is exactly the sort of thing a guard like this breaks
+    // quietly.
+    for (model.thread_notes[0..model.thread_notes_len]) |*note| note.setTime(now);
+    if (model.viewing_profile != null) {
+        model.thread_loading = model.thread_notes_len == 0 and
+            g_thread_done_seq.load(.acquire) < model.thread_seq;
+    }
+    model.settleTopicLoading(now);
+}
+
+/// Forgets the store count the last tick saw, so a test's first tick reads.
+pub fn forgetLevelCountForTest() void {
+    g_last_level_count = std.math.maxInt(usize);
+}
+
+/// One tick of the open level's upkeep, for a test.
+pub fn refreshOpenLevelForTest(model: *Model, now: i64) void {
+    refreshOpenLevel(model, now);
+}
+
+/// Marks the fetch for generation `seq` as finished, the way its worker does
+/// when every relay has answered, for a test that has no worker.
+pub fn finishLevelFetchForTest(seq: u64) void {
+    g_thread_done_seq.store(seq, .release);
+}
+
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
         .tick => |t| {
@@ -33286,26 +33367,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 //
                 // The open paths call these directly, so a thread still fills
                 // the moment it is opened; this only skips the repeat.
-                const level_count = if (g_store) |st| (st.eventCount() catch g_last_level_count) else g_last_level_count;
-                if (level_count != g_last_level_count) {
-                    g_last_level_count = level_count;
-                    model.refreshThreadNotes(now);
-                    // And the open person's notes, for the same reason and with
-                    // the same consequence if it is missed: without this the
-                    // backfill this screen fires never appears, and the quiet
-                    // line saying they have written nothing stays up over a
-                    // store that has since filled with their notes.
-                    model.refreshProfileNotes(now);
-                }
-                // Relative times were a side effect of the rebuild, so they have
-                // to be kept up now that the rebuild is conditional. "2m" going
-                // stale is exactly the sort of thing a guard like this breaks
-                // quietly.
-                for (model.thread_notes[0..model.thread_notes_len]) |*note| note.setTime(now);
-                if (model.viewing_profile != null) {
-                    model.thread_loading = model.thread_notes_len == 0 and
-                        g_thread_done_seq.load(.acquire) < model.thread_seq;
-                }
+                refreshOpenLevel(model, now);
                 // Anything still owed goes back out whenever a relay is up: this
                 // is the drain, and it is idempotent, since an entry already in
                 // flight is skipped.
@@ -39129,6 +39191,11 @@ fn enterThread(model: *Model, root: Note) void {
 /// is a push and this; a newer copy of an article the reader is already reading
 /// is this alone, so Back still goes where it went before.
 fn setThreadRoot(model: *Model, root: Note) void {
+    // A topic or the bookmark list outranks a thread when the view is built,
+    // so left set, either one hid the thread: pressing a note on those pages
+    // opened nothing. The level being left is already on the stack.
+    model.topic_len = 0;
+    model.viewing_bookmarks = false;
     model.viewing_profile = null;
     model.viewing_thread = root.id;
     model.thread_root = root;
@@ -39378,8 +39445,13 @@ fn fetchOlderWorker(until: i64) void {
 /// relays behind it. A topic has no author, so the outbox model has nothing to
 /// say about where to ask: the reader's own read relays are the honest answer,
 /// rather than a search relay nobody chose.
-fn openTopic(model: *Model, topic: []const u8) void {
-    if (topic.len == 0 or topic.len > max_topic_bytes) return;
+fn openTopic(model: *Model, topic_in: []const u8) void {
+    if (topic_in.len == 0 or topic_in.len > max_topic_bytes) return;
+    // NIP-24: `t` values are lowercase, and a relay matches them exactly, so
+    // `#Nostr` asked for as written finds nothing that `contentTags` published.
+    var folded: [max_topic_bytes]u8 = undefined;
+    for (topic_in, 0..) |c, i| folded[i] = std.ascii.toLower(c);
+    const topic = folded[0..topic_in.len];
     // Already here: pressing `#zig` inside the `#zig` topic would otherwise push
     // a second copy of it and cost a Back to undo.
     if (model.viewingTopic()) |current| {
@@ -39388,6 +39460,7 @@ fn openTopic(model: *Model, topic: []const u8) void {
     model.notifications_return = model.notifications_open;
     model.notifications_open = false;
     pushCurrentScreen(model);
+    model.viewing_bookmarks = false;
     model.viewing_profile = null;
     model.viewing_thread = 0;
     model.thread_notes_len = 0;
@@ -39441,6 +39514,8 @@ fn enterProfile(model: *Model, pubkey: [32]u8) void {
         if (std.mem.eql(u8, &current, &pubkey)) return;
     }
     pushCurrentScreen(model);
+    model.topic_len = 0;
+    model.viewing_bookmarks = false;
     model.viewing_profile = pubkey;
     model.viewing_thread = 0;
     model.thread_notes_len = 0;
@@ -40401,6 +40476,11 @@ fn goHome(model: *Model) void {
     model.thread_stack_len = 0;
     model.viewing_profile = null;
     model.viewing_thread = 0;
+    // Every kind of level, not the two that were written first. A topic and the
+    // bookmark list were left set, so `levelOpen` stayed true and the mark did
+    // nothing from either page.
+    model.topic_len = 0;
+    model.viewing_bookmarks = false;
     model.thread_loading = false;
     model.thread_notes_len = 0;
     model.reply_buffer.clear();
@@ -40495,11 +40575,30 @@ fn closeThread(model: *Model) void {
 var g_thread_seq = std.atomic.Value(u64).init(0);
 var g_thread_done_seq = std.atomic.Value(u64).init(0);
 
-/// Fetches a person's recent notes (and their engagement) into the store, on a
-/// detached thread. Mirrors the thread's two-phase backfill exactly: one dial per
-/// read relay, their kind:1s, then on EOSE a second subscription for what those
-/// notes collected, folding into the same engagement table the feed and threads
-/// use. Without the second phase every row on a profile shows zero counts.
+const topic_kinds = [_]u16{1};
+
+/// The filter for a topic: kind:1 notes carrying a `t` tag with this value,
+/// newest `thread_reply_cap`. One definition for the store read and the relay
+/// ask, so the two cannot drift into answering different questions.
+///
+/// Jumble sends `{"#t":[tag]}` to its default relays with the tag lowercased
+/// (src/pages/secondary/NoteListPage/index.tsx:49, src/lib/link.ts:29), and
+/// Amethyst keys the subscription on the lowercased tag and asks for kind 1
+/// among others (HashtagFeedFilterSubAssembler.kt, FilterPostsByHashtags.kt:81-95).
+/// NIP-24 says `t` values are lowercase, which `openTopic` guarantees.
+fn topicFilter(values: *const [1][]const u8, tags: *[1]nostr.filter.TagFilter) nostr.filter.Filter {
+    tags.* = .{.{ .letter = 't', .values = values }};
+    return .{ .kinds = &topic_kinds, .tags = tags, .limit = thread_reply_cap };
+}
+
+/// The REQ a topic sends, as the relay receives it.
+pub fn topicReqForTest(gpa: std.mem.Allocator, topic: []const u8) ![]u8 {
+    const values = [_][]const u8{topic};
+    var tags: [1]nostr.filter.TagFilter = undefined;
+    const filters = [_]nostr.filter.Filter{topicFilter(&values, &tags)};
+    return nostr.message.encodeReq(gpa, "plaza-topic", &filters);
+}
+
 /// Asks this reader's read relays for a topic, once. A topic has no author, so
 /// there is no outbox question to answer: the relays this reader already reads
 /// are the honest set, rather than a search relay nobody chose.
@@ -40527,12 +40626,9 @@ fn fetchTopicWorker(topic_buf: [max_topic_bytes]u8, topic_len: u8, seq: u64) voi
     defer g_thread_done_seq.store(seq, .release);
 
     const topic = topic_buf[0..topic_len];
-    const kinds = [_]u16{1};
     const values = [_][]const u8{topic};
-    const tags = [_]nostr.filter.TagFilter{.{ .letter = 't', .values = &values }};
-    const filters = [_]nostr.filter.Filter{
-        .{ .kinds = &kinds, .tags = &tags, .limit = thread_reply_cap },
-    };
+    var tags: [1]nostr.filter.TagFilter = undefined;
+    const filters = [_]nostr.filter.Filter{topicFilter(&values, &tags)};
 
     for (0..relaySlots()) |ri| {
         var url_buf: [96]u8 = undefined;
@@ -40568,6 +40664,11 @@ fn fetchTopicWorker(topic_buf: [max_topic_bytes]u8, topic_len: u8, seq: u64) voi
     }
 }
 
+/// Fetches a person's recent notes (and their engagement) into the store, on a
+/// detached thread. Mirrors the thread's two-phase backfill exactly: one dial per
+/// read relay, their kind:1s, then on EOSE a second subscription for what those
+/// notes collected, folding into the same engagement table the feed and threads
+/// use. Without the second phase every row on a profile shows zero counts.
 fn fetchProfileNotes(pubkey: [32]u8, seq: u64) void {
     if (!relayFetchAllowed()) {
         g_thread_done_seq.store(seq, .release);
@@ -42680,6 +42781,8 @@ fn performLogout(model: *Model, fx: *Effects) void {
     model.viewing_thread = 0;
     model.thread_stack_len = 0;
     model.viewing_profile = null;
+    model.topic_len = 0;
+    model.viewing_bookmarks = false;
     // And off the disk. An unfinished note is the previous account's private
     // thinking; leaving it would hand it to whoever signs in next, in their
     // composer, one keystroke from being published under THEIR key.
