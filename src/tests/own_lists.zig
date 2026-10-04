@@ -19,6 +19,7 @@ const Msg = main.Msg;
 const harness = @import("../tests.zig");
 
 // ---- from tests.zig
+const findByLabel = harness.findByLabel;
 const FreshStore = harness.FreshStore;
 const app_sources = harness.app_sources;
 const buildTree = harness.buildTree;
@@ -711,6 +712,43 @@ test "a first media server list waits for the relays the reader writes to, and f
     const tags = main.ownRecordTagsJoinedForTest(arena, 10063) orelse return error.NothingWritten;
     try testing.expect(std.mem.indexOf(u8, tags, "server https://one.example") != null);
     try testing.expect(!main.needsFreshConsentForTest(.media_servers));
+}
+
+test "the new-list question asked from Settings stands over Settings" {
+    var fs: FreshStore = undefined;
+    try fs.open("asksettings");
+    defer fs.close();
+    main.forgetBlossomForTest();
+    defer main.forgetBlossomForTest();
+    const me = signInNothingFound(0x6d);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .open_settings, &fx);
+    main.retryOwnListsReadForTest();
+    for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
+    model.blossom_buffer.set("https://one.example");
+    main.update(&model, .blossom_add, &fx);
+    try testing.expect(model.fresh_ask != null);
+
+    // The question and the page it was asked from, both. It used to stand on
+    // the feed alone, and Settings vanished from behind it.
+    const tree = try buildTree(arena, &model);
+    try testing.expect(findByText(tree.root, .button, "Start a new list") != null);
+    // The server field is on the Settings page and nowhere else.
+    try testing.expect(findAnyTextContaining(tree.root, "one.example"));
+
+    // And the same with the Edit profile sheet up over Settings.
+    model.editing_profile = true;
+    const over_sheet = try buildTree(arena, &model);
+    try testing.expect(findByText(over_sheet.root, .button, "Start a new list") != null);
+    try testing.expect(findByLabel(over_sheet.root, "Edit profile") != null);
 }
 test "every toast the app can show fits the toast whole" {
     // The toast is one line of text over a 48-byte buffer, and `setToast` cuts

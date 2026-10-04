@@ -60,6 +60,15 @@ fn appViewLayers(ui: *AppUi, model: *const Model) AppUi.Node {
         return ui.stack(.{ .grow = 1 }, .{ base, deleteConfirm(ui) });
     }
     if (model.fresh_ask) |ask| {
+        // Settings raises this one too (a first media server), and Settings is
+        // a sheet over the feed: stacked straight on the feed, the question
+        // made the page it was asked from disappear behind it.
+        if (model.stage == .settings) {
+            if (model.editing_profile) {
+                return ui.stack(.{ .grow = 1 }, .{ base, settingsSheet(ui, model), profileSheet(ui, model), freshListConfirm(ui, ask) });
+            }
+            return ui.stack(.{ .grow = 1 }, .{ base, settingsSheet(ui, model), freshListConfirm(ui, ask) });
+        }
         return ui.stack(.{ .grow = 1 }, .{ base, freshListConfirm(ui, ask) });
     }
     if (model.expanded_note) |note_id| {
