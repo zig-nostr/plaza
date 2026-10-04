@@ -7079,6 +7079,7 @@ pub const collectText = view_note.collectText;
 pub const contentSpans = view_note.contentSpans;
 pub const contentSpansIn = view_note.contentSpansIn;
 pub const elide = view_note.elide;
+pub const elideUnits = view_note.elideUnits;
 pub const engagementRow = view_note.engagementRow;
 pub const engagementRowAt = view_note.engagementRowAt;
 pub const firstLineOf = view_note.firstLineOf;

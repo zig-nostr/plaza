@@ -304,7 +304,7 @@ const identity_name_units = 48;
 /// character from U+2E80 up (CJK, emoji) counts two, because it draws about
 /// twice as wide as a Latin letter and a cap on codepoints alone would let a
 /// line of them run twice as far.
-fn elideUnits(ui: *AppUi, text: []const u8, units: usize) []const u8 {
+pub fn elideUnits(ui: *AppUi, text: []const u8, units: usize) []const u8 {
     var i: usize = 0;
     var used: usize = 0;
     while (i < text.len) {

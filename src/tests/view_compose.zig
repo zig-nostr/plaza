@@ -53,3 +53,42 @@ test "an insert that will not fit is refused, not truncated" {
     try testing.expect(std.mem.indexOf(u8, model.draft(), "nostr:npub1") != null);
     try testing.expect(model.draft().len > 60);
 }
+
+test "a notify chip cuts a long name on a character and says it was cut" {
+    // The chip hugs its name, so the name is cut. It used to stop at fourteen
+    // characters with nothing to say so ("Bob the Builde").
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    main.resetProfilesForTest();
+    defer main.resetProfilesForTest();
+
+    const Build = struct {
+        var model: Model = .{};
+        var root: main.Note = .{};
+        fn row(ui: *main.AppUi) main.AppUi.Node {
+            return main.replyNotifyRow(ui, &model, &root);
+        }
+    };
+    Build.model = .{};
+    Build.root = .{};
+    Build.root.pubkey = [_]u8{0x6e} ** 32;
+    main.setProfileNameForTest(Build.root.pubkey, "Bob the Builder of Many Unreasonably Long Things");
+
+    const p = try painted.Painted.renderPiece(arena, &Build.model, Build.row, main.window_width, 200);
+    var chip: ?[]const u8 = null;
+    for (p.layout.nodes) |node| {
+        if (std.mem.startsWith(u8, node.widget.text, "Bob the")) chip = node.widget.text;
+    }
+    const text = chip orelse return error.NoChip;
+    try testing.expectEqualStrings("Bob the Builde\u{2026}", text);
+
+    // A short name is shown whole, with no ellipsis.
+    main.setProfileNameForTest(Build.root.pubkey, "Bob");
+    const q = try painted.Painted.renderPiece(arena, &Build.model, Build.row, main.window_width, 200);
+    var short: ?[]const u8 = null;
+    for (q.layout.nodes) |node| {
+        if (std.mem.startsWith(u8, node.widget.text, "Bob")) short = node.widget.text;
+    }
+    try testing.expectEqualStrings("Bob", short orelse return error.NoChip);
+}

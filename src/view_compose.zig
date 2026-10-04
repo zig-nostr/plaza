@@ -22,11 +22,11 @@ const Note = main.Note;
 const activePubkey = main.activePubkey;
 const avatarTint = main.avatarTint;
 const avatar_size = main.avatar_size;
-const clipToChars = main.clipToChars;
 const compose_capacity = main.compose_capacity;
 const compose_editor_height = main.compose_editor_height;
 const compose_editor_width = main.compose_editor_width;
 const compose_sheet_width = main.compose_sheet_width;
+const elideUnits = main.elideUnits;
 const hgap = main.hgap;
 const identityInk = main.identityInk;
 const inFollowGraph = main.inFollowGraph;
@@ -486,6 +486,9 @@ pub fn replyNotifyRow(ui: *AppUi, model: *const Model, root: *const Note) AppUi.
     return ui.column(.{ .gap = 0 }, .{ vgap(ui, 8), notifyChips(ui, model, people[0..n]) });
 }
 
+/// How much of a name a notify chip shows, in width units, cut with an ellipsis.
+const notify_name_units = 14;
+
 fn notifyChips(ui: *AppUi, model: *const Model, people: []const [32]u8) AppUi.Node {
     const p = theme.palette;
     if (people.len == 0) return ui.spacer(0);
@@ -536,7 +539,7 @@ fn notifyChips(ui: *AppUi, model: *const Model, people: []const [32]u8) AppUi.No
                         hgap(ui, 10),
                         ui.paragraph(
                             .{ .style = .{ .foreground = if (off) p.text_muted else p.text_secondary } },
-                            &.{.{ .text = clipToChars(personName(ui, pubkey), 14, 42), .scale = stat_scale }},
+                            &.{.{ .text = elideUnits(ui, personName(ui, pubkey), notify_name_units), .scale = stat_scale }},
                         ),
                         hgap(ui, 10),
                         vgap(ui, 24),
