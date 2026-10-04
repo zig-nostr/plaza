@@ -1327,14 +1327,32 @@ fn noteEventId(model: *const Model, note_id: i64) ?[32]u8 {
 pub fn dupeTags(gpa: std.mem.Allocator, tags: []const nostr.event.Tag) ?[]const nostr.event.Tag {
     if (tags.len == 0) return &.{};
     const out = gpa.alloc(nostr.event.Tag, tags.len) catch return null;
-    for (tags, 0..) |tag, i| {
-        const fields = gpa.alloc([]const u8, tag.len) catch return null;
-        for (tag, 0..) |field, j| {
-            fields[j] = gpa.dupe(u8, field) catch return null;
+    // A failure part way frees what was already copied, so a refused copy leaves
+    // nothing behind for a caller that has no way to know there was something.
+    var done: usize = 0;
+    while (done < tags.len) : (done += 1) {
+        const tag = tags[done];
+        const fields = gpa.alloc([]const u8, tag.len) catch return freePartialTags(gpa, out, done);
+        var copied: usize = 0;
+        while (copied < tag.len) : (copied += 1) {
+            fields[copied] = gpa.dupe(u8, tag[copied]) catch {
+                for (fields[0..copied]) |f| gpa.free(f);
+                gpa.free(fields);
+                return freePartialTags(gpa, out, done);
+            };
         }
-        out[i] = fields;
+        out[done] = fields;
     }
     return out;
+}
+
+fn freePartialTags(gpa: std.mem.Allocator, out: []nostr.event.Tag, done: usize) ?[]const nostr.event.Tag {
+    for (out[0..done]) |tag| {
+        for (tag) |field| gpa.free(field);
+        gpa.free(tag);
+    }
+    gpa.free(out);
+    return null;
 }
 
 /// The engine write seam: a note this process now holds, whether locally signed

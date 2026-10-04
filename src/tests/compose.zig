@@ -458,6 +458,30 @@ test "a tag copy that could not complete reads as no base, not as an empty one" 
     var failing = testing.FailingAllocator.init(a.allocator(), .{ .fail_index = 1 });
     try testing.expect(main.dupeTagsForTest(failing.allocator(), &tags) == null);
 }
+test "a tag copy that fails part way frees what it had copied" {
+    // Every allocation is failed in turn under the leak-checking allocator, so a
+    // partial copy left behind fails the test. The copy is freed when it works.
+    const gpa = testing.allocator;
+    const tags = [_]nostr.event.Tag{
+        &.{ "i", "github:someone", "a-proof-url" },
+        &.{ "p", "aa" ** 32 },
+        &.{"t"},
+    };
+    var fail_index: usize = 0;
+    while (fail_index < 32) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        const copy = main.dupeTagsForTest(failing.allocator(), &tags) orelse continue;
+        for (copy) |tag| {
+            for (tag) |field| gpa.free(field);
+            gpa.free(tag);
+        }
+        gpa.free(copy);
+        break;
+    }
+    // Ten allocations make a whole copy (one slice, three tags, six fields),
+    // so the loop refused at least that many times before one went through.
+    try testing.expect(fail_index >= 10 and fail_index < 32);
+}
 test "the content-warning tag is read with a reason, without one, and when malformed" {
     // The TAG is the warning, not the sentence in it. A bare tag, an empty reason
     // and a reason with a control character in it all ask for the note to be
