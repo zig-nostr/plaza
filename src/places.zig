@@ -13,6 +13,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const handlePlazaLink = main.handlePlazaLink;
+const takePendingLink = main.takePendingLink;
 const Effects = main.Effects;
 const Model = main.Model;
 const askPool = main.askPool;
@@ -1857,6 +1859,10 @@ pub fn markPlaceFetchAppliedForTest() void {
 pub fn placeFetchArmedForTest() bool {
     return g_place_want != null;
 }
+
+pub fn forgetPlaceFetchForTest() void {
+    g_place_want = null;
+}
 pub fn savePlacesForTest() void {
     savePlaces();
 }
@@ -1989,6 +1995,19 @@ pub fn visitingPlaceForTest() ?*const Place {
 }
 pub fn resumeVisitForTest() void {
     resumeVisit();
+}
+
+pub fn drainPendingLink(model: *Model, fx: *Effects) void {
+    // Not while the Edit profile sheet is up. Following the link leaves
+    // Settings, which hides the sheet and what was typed in it, so the link
+    // stays where it is until the sheet closes.
+    if (model.stage == .settings and model.editing_profile) return;
+    var link_buf: [2048]u8 = undefined;
+    if (takePendingLink(&link_buf)) |link| handlePlazaLink(model, fx, link);
+}
+
+pub fn drainPendingLinkForTest(model: *Model, fx: *Effects) void {
+    drainPendingLink(model, fx);
 }
 pub const place_looking_toast_for_test = place_looking_toast;
 /// Gives the open place one write relay of its own, the way a parsed document

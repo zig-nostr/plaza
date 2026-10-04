@@ -3423,8 +3423,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Polling rather than an effect because the Apple Event lands
                 // on the main thread outside the SDK's event loop entirely,
                 // so there is nothing to subscribe to.
-                var link_buf: [2048]u8 = undefined;
-                if (takePendingLink(&link_buf)) |link| handlePlazaLink(model, fx, link);
+                drainPendingLink(model, fx);
                 refreshPlaceFetch(model);
                 // Beside it, and after it: a place arriving from a link moves
                 // the reader into a room, and that is a walk away from a note
@@ -5302,6 +5301,9 @@ pub const nip05Resolve = login.nip05Resolve;
 pub const parseAddress = login.parseAddress;
 
 // re-exports: places.zig
+pub const drainPendingLinkForTest = places.drainPendingLinkForTest;
+pub const forgetPlaceFetchForTest = places.forgetPlaceFetchForTest;
+pub const drainPendingLink = places.drainPendingLink;
 pub const activePlaceIndexForTest = places.activePlaceIndexForTest;
 pub const applyActivePlaceLineForTest = places.applyActivePlaceLineForTest;
 pub const armPlaceFetchForTest = places.armPlaceFetchForTest;

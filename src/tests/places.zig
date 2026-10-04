@@ -2337,6 +2337,55 @@ test "an address for a place nobody has says it is looking, then that it did not
     try testing.expect(main.activePlace() == null);
 }
 
+test "a plaza link leaves Settings and the notifications sheet, and says it is looking" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var f: AddressFixture = undefined;
+    try f.up("linkover");
+    defer f.down();
+    defer main.forgetPlaceFetchForTest();
+    const host = [_]u8{0x3e} ** 32;
+    var link_buf: [512]u8 = undefined;
+    const naddr = try nostr.nip19.encodeNaddr(arena, "linked-room", host, main.place_kind_for_test, &.{});
+    const link = try std.fmt.bufPrint(&link_buf, "plaza://place/{s}", .{naddr});
+
+    // Clicked while Settings is open: the room would arrive under it.
+    main.update(&f.model, .open_settings, &f.fx);
+    try testing.expect(f.model.stage == .settings);
+    main.captureArgvLinkForTest(link);
+    main.drainPendingLinkForTest(&f.model, &f.fx);
+    try testing.expect(main.placeFetchArmedForTest());
+    try testing.expect(f.model.stage == .ready);
+    try testing.expectEqualStrings("Looking for that place", f.model.toast_text());
+
+    // Clicked with the notifications sheet up.
+    main.resetPlacesForTest();
+    f.model.notifications_open = true;
+    f.model.toast_len = 0;
+    main.captureArgvLinkForTest(link);
+    main.drainPendingLinkForTest(&f.model, &f.fx);
+    try testing.expect(!f.model.notifications_open);
+    try testing.expect(!f.model.notifications_return);
+    try testing.expectEqualStrings("Looking for that place", f.model.toast_text());
+
+    // Clicked while a profile is being edited: it waits for the sheet, which
+    // keeps what was typed in it.
+    main.resetPlacesForTest();
+    main.forgetPlaceFetchForTest();
+    main.update(&f.model, .open_settings, &f.fx);
+    f.model.editing_profile = true;
+    main.captureArgvLinkForTest(link);
+    main.drainPendingLinkForTest(&f.model, &f.fx);
+    try testing.expect(!main.placeFetchArmedForTest());
+    try testing.expect(f.model.stage == .settings and f.model.editing_profile);
+    f.model.editing_profile = false;
+    main.drainPendingLinkForTest(&f.model, &f.fx);
+    try testing.expect(main.placeFetchArmedForTest());
+    try testing.expect(f.model.stage == .ready);
+}
+
 test "a place that turns up retires the looking toast" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

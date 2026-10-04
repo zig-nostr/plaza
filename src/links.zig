@@ -12,6 +12,11 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const place_looking_toast = main.place_looking_toast;
+const setToast = main.setToast;
+const samePlace = main.samePlace;
+const leaveNotifications = main.leaveNotifications;
+const leaveSettings = main.leaveSettings;
 const Effects = main.Effects;
 const Model = main.Model;
 const askPlace = main.askPlace;
@@ -235,7 +240,6 @@ pub fn parsePlazaLink(link: []const u8) ?[]const u8 {
     return rest;
 }
 pub fn handlePlazaLink(model: *Model, fx: *Effects, link: []const u8) void {
-    _ = model;
     const naddr = parsePlazaLink(link) orelse return;
     const gpa = std.heap.page_allocator;
     var ptr = nostr.nip19.decodeNaddr(gpa, naddr) catch return;
@@ -248,6 +252,15 @@ pub fn handlePlazaLink(model: *Model, fx: *Effects, link: []const u8) void {
     want.ident_len = @intCast(copyBounded(&want.ident_buf, ptr.identifier));
     places.g_place_want = want;
     askPlace(fx, ptr.relays);
+    // What the address field does with a place, for the same reasons: the room
+    // is drawn under Settings and the notifications sheet, so both are left,
+    // and a room is not a level that Back could return to the sheet through.
+    if (model.stage == .settings) leaveSettings(model);
+    leaveNotifications(model);
+    if (!model.levelOpen()) model.notifications_return = false;
+    // And the link was heard. The tick reads the store right after this, and
+    // a room already held there opens and takes the toast down again.
+    if (!samePlace(want)) setToast(model, place_looking_toast);
 }
 
 pub fn writePendingLinkForTest(io: std.Io, dir: *std.Io.Dir, link: []const u8, now_s: i64) void {
