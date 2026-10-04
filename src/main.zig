@@ -33756,9 +33756,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_login_error.store(@intFromEnum(LoginError.none), .release);
         },
         .open_address => {
+            // Cmd+L with the field already up leaves it as it is: what is typed
+            // in it and what that found. Starting over would empty the list
+            // under a term that is still there, and never ask the relays for it.
+            if (!model.address_open) {
+                model.address_error = .none;
+                searchOpen();
+            }
             model.address_open = true;
-            model.address_error = .none;
-            searchOpen();
             // The row that opens this lives in the account menu, and a menu
             // left standing under a sheet is a menu the reader has to dismiss
             // twice.

@@ -29171,6 +29171,29 @@ test "typing asks the relays once the typing stops, once" {
     try testing.expect(!main.searchAskedForTest());
 }
 
+test "opening search again while it is up keeps the term and what it found" {
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    main.resetProfilesForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    typeIntoSearch(&model, "alice");
+    const gen = main.searchGenForTest();
+    main.searchArrivedForTest(gen, 0, [_]u8{0x21} ** 32);
+    main.searchTickForTest(&model, 0);
+    try testing.expectEqual(@as(usize, 1), main.searchRowCountForTest());
+
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg.open_address, &fx);
+    try testing.expect(model.address_open);
+    try testing.expectEqualStrings("alice", model.address_draft());
+    try testing.expectEqual(@as(usize, 1), main.searchRowCountForTest());
+    // And the term is still put to the relays once typing has settled.
+    main.searchTickForTest(&model, 100_000);
+    try testing.expect(main.searchAskedForTest());
+}
+
 test "a key, a signer link or a web link typed into search never leaves the machine" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
