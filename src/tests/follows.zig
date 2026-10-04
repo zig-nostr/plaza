@@ -203,6 +203,7 @@ test "a refused reply never changes a box with something in it" {
     try testing.expect(harness.pressableByLabel(tree, tree.root, "Copy the replies that were not signed"));
     main.update(&model, .{ .refused_copy = .reply }, &fx);
     try testing.expectEqualStrings("the first try", main.lastClipboardForTest());
+    main.update(&model, .{ .refused_copied = .{ .key = main.refused_text_clip_key, .outcome = .ok } }, &fx);
     try testing.expectEqual(@as(usize, 0), main.refusedCount(&model, .reply));
     try testing.expectEqualStrings("started again", model.reply_draft());
     const after = try buildTree(arena_state.allocator(), &model);

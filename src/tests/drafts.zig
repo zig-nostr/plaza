@@ -102,9 +102,10 @@ test "refused notes wait beside the composer until Copy, and only Copy writes th
     try testing.expect(harness.pressableByLabel(tree, tree.root, "Dismiss the notes that were not signed"));
 
     // Copy: both, oldest first, and the warning that could not come along is
-    // said instead. The line goes with them.
+    // said instead. The line goes with them once the clipboard has them.
     main.update(&model, .{ .refused_copy = .note }, &fx);
     try testing.expectEqualStrings("the first\n\nthe second", main.lastClipboardForTest());
+    main.update(&model, .{ .refused_copied = .{ .key = main.refused_text_clip_key, .outcome = .ok } }, &fx);
     try testing.expectEqualStrings("Copied. Set its content warning again.", model.toast_text());
     try testing.expectEqual(@as(usize, 0), main.refusedCount(&model, .note));
     try testing.expect(!harness.findAnyTextContaining((try harness.buildTree(arena, &model)).root, "not signed"));
@@ -122,6 +123,46 @@ test "refused notes wait beside the composer until Copy, and only Copy writes th
     try testing.expectEqualStrings("the covered one", model.draft());
     try testing.expect(model.warn_on);
     try testing.expectEqualStrings("spoilers", model.warn_draft());
+}
+
+test "a Copy the clipboard refuses keeps every refused note, and says so" {
+    // They were let go as they were handed over, so a write the toolkit
+    // refused (its key still busy, say) lost them all.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    defer main.forgetRefused();
+    main.clearLastClipboardForTest();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    model.draft_buffer.set("typing");
+    _ = main.giveDraftBack(&model, "the first", .{});
+    _ = main.giveDraftBack(&model, "the second", .{});
+
+    main.update(&model, .{ .refused_copy = .note }, &fx);
+    try testing.expectEqualStrings("the first\n\nthe second", main.lastClipboardForTest());
+    try testing.expectEqual(@as(usize, 2), main.refusedCount(&model, .note));
+    // A second press while the first is out writes nothing.
+    main.clearLastClipboardForTest();
+    main.update(&model, .{ .refused_copy = .note }, &fx);
+    try testing.expectEqualStrings("", main.lastClipboardForTest());
+
+    main.update(&model, .{ .refused_copied = .{ .key = main.refused_text_clip_key, .outcome = .rejected } }, &fx);
+    try testing.expectEqual(@as(usize, 2), main.refusedCount(&model, .note));
+    try testing.expectEqualStrings("Not copied. They are still kept here.", model.toast_text());
+    const tree = try harness.buildTree(arena_state.allocator(), &model);
+    try testing.expect(harness.findAnyTextContaining(tree.root, "2 notes were not signed. They are kept here."));
+
+    // Copy again works, and lets go of only what it carried: a note refused
+    // while the answer was on its way stays.
+    main.update(&model, .{ .refused_copy = .note }, &fx);
+    try testing.expectEqualStrings("the first\n\nthe second", main.lastClipboardForTest());
+    _ = main.giveDraftBack(&model, "the third", .{});
+    main.update(&model, .{ .refused_copied = .{ .key = main.refused_text_clip_key, .outcome = .ok } }, &fx);
+    try testing.expectEqual(@as(usize, 1), main.refusedCount(&model, .note));
+    try testing.expectEqualStrings("the third", main.refusedTextForTest(0).?);
+    try testing.expectEqualStrings("Copied", model.toast_text());
 }
 
 test "kept refused notes stop at a cap that fits one copy, and say so" {

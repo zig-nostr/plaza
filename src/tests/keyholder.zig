@@ -507,6 +507,7 @@ test "every note a bunker refuses in one sweep is kept, not only the first" {
     // Copy takes both, oldest first.
     main.update(&model, .{ .refused_copy = .note }, &fx);
     try testing.expectEqualStrings("first note\n\nsecond note", main.lastClipboardForTest());
+    main.update(&model, .{ .refused_copied = .{ .key = main.refused_text_clip_key, .outcome = .ok } }, &fx);
     try testing.expectEqual(@as(usize, 0), main.refusedCount(&model, .note));
 }
 

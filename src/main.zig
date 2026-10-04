@@ -2824,8 +2824,10 @@ pub const Msg = union(enum) {
     /// Copy a note's words to the clipboard (by id).
     copy_note_text: i64,
     /// Copy every note or reply kept under this box after a signer refused it,
-    /// and let them go.
+    /// and let them go once the clipboard has them.
     refused_copy: drafts.RefusedBox,
+    /// The clipboard's answer to that Copy.
+    refused_copied: native_sdk.EffectClipboardResult,
     /// Let them go without copying.
     refused_dismiss: drafts.RefusedBox,
     quote_note: i64,
@@ -2948,6 +2950,7 @@ pub const Msg = union(enum) {
         "open_notary_window",
         "copy_note_text",
         "refused_copy",
+        "refused_copied",
         "refused_dismiss",
         "quote_note",
         "close_mentions",
@@ -4304,6 +4307,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .close_mentions => model.mention_dismissed = true,
         .refused_copy => |box| copyRefused(model, fx, box),
+        .refused_copied => |result| refusedCopied(model, result),
         .refused_dismiss => |box| dismissRefused(model, box),
         .copy_note_text => |id| {
             // The words as the note wrote them, not as the feed renders them:
@@ -4715,11 +4719,19 @@ pub fn sayMuteWrite(model: *Model, outcome: MuteWrite, muting: bool) void {
 /// effect queue behind `fx` does not exist there and the text is the thing worth
 /// checking: what Plaza hands another client.
 pub fn writeClipboardText(fx: *Effects, key: u64, text: []const u8) void {
+    writeClipboardTextReported(fx, key, text, null);
+}
+
+/// The same, with the toolkit's answer delivered as `on_result`: whether the
+/// text reached the clipboard, or the write was refused (its key still busy,
+/// every effect slot taken) or failed. A test build delivers nothing; the test
+/// sends the answer it is about.
+pub fn writeClipboardTextReported(fx: *Effects, key: u64, text: []const u8, on_result: ?Effects.ClipboardMsgFn) void {
     if (builtin.is_test) {
         g_last_clipboard_len = copyBounded(&g_last_clipboard, text);
         return;
     }
-    fx.writeClipboard(.{ .key = key, .text = text });
+    fx.writeClipboard(.{ .key = key, .text = text, .on_result = on_result });
 }
 var g_last_clipboard: [native_sdk.max_effect_clipboard_bytes]u8 = undefined;
 var g_last_clipboard_len: usize = 0;
@@ -6552,6 +6564,7 @@ pub const takePending = remote_signer.takePending;
 pub const RefusedBox = drafts.RefusedBox;
 pub const RefusedBack = drafts.RefusedBack;
 pub const copyRefused = drafts.copyRefused;
+pub const refusedCopied = drafts.refusedCopied;
 pub const dismissRefused = drafts.dismissRefused;
 pub const forgetRefused = drafts.forgetRefused;
 pub const giveDraftBack = drafts.giveDraftBack;

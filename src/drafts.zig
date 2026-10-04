@@ -14,7 +14,7 @@ const geometry = native_sdk.geometry;
 // ---- from main.zig
 const WarnCarry = main.WarnCarry;
 const refused_text_clip_key = main.refused_text_clip_key;
-const writeClipboardText = main.writeClipboardText;
+const writeClipboardTextReported = main.writeClipboardTextReported;
 const Effects = main.Effects;
 const note_content_cap = main.note_content_cap;
 const warning_input_capacity = main.warning_input_capacity;
@@ -287,6 +287,10 @@ const RefusedText = struct {
     root: [32]u8 = @splat(0),
     /// A note's own content warning, never lent to anything else.
     warn: WarnCarry = .{},
+    /// Handed to the clipboard by a Copy whose answer has not come back.
+    copying: bool = false,
+    /// To be let go by the next `compactRefused`.
+    drop: bool = false,
     len: usize = 0,
     text: [compose_capacity]u8 = undefined,
 };
@@ -295,6 +299,10 @@ var g_refused: [refused_slots]RefusedText = [_]RefusedText{.{}} ** refused_slots
 var g_refused_len: usize = 0;
 /// One copy of everything kept for a box, built when Copy is pressed.
 var g_refused_copy: [refused_slots * (compose_capacity + 2)]u8 = undefined;
+/// A Copy is waiting for the clipboard's answer.
+var g_refused_copy_out = false;
+/// And one of the texts it carries had a content warning.
+var g_refused_copy_warned = false;
 
 /// Gives a note the signer refused back to the reader, and never at the cost
 /// of what is in the composer now.
@@ -378,9 +386,16 @@ pub fn refusedFull() bool {
 }
 
 /// Copy: every text kept for this box, oldest first and a blank line apart, to
-/// the clipboard, and then they are let go. The only place a refused text is
-/// written to the clipboard.
+/// the clipboard. The only place a refused text is written to the clipboard.
+///
+/// They are let go only when the clipboard says it has them (see
+/// `refusedCopied`). The toolkit can refuse the write, and texts dropped as
+/// they were handed over would then be on the clipboard and nowhere else.
 pub fn copyRefused(model: *Model, fx: *Effects, box: RefusedBox) void {
+    // One Copy at a time. Its key is busy until the answer comes back, so a
+    // second write would be refused anyway, and its answer would be read as
+    // the first one's.
+    if (g_refused_copy_out) return;
     const root = refusedRoot(model, box);
     var len: usize = 0;
     var warned = false;
@@ -393,26 +408,47 @@ pub fn copyRefused(model: *Model, fx: *Effects, box: RefusedBox) void {
         @memcpy(g_refused_copy[len..][0..r.len], r.text[0..r.len]);
         len += r.len;
         warned = warned or r.warn.on;
+        r.copying = true;
     }
     if (len == 0) return;
+    g_refused_copy_out = true;
+    g_refused_copy_warned = warned;
     // The toolkit copies the text when it is handed over, so the copy here can
     // be wiped at once.
-    writeClipboardText(fx, refused_text_clip_key, g_refused_copy[0..len]);
+    writeClipboardTextReported(fx, refused_text_clip_key, g_refused_copy[0..len], Effects.clipboardMsg(.refused_copied));
     @memset(g_refused_copy[0..len], 0);
-    dropRefused(box, root);
+}
+
+/// The clipboard's answer to Copy. On success the texts it carried are let go,
+/// and only those: one refused while the answer was on its way was not copied.
+/// Otherwise every one stays where it was, and the toast says so.
+pub fn refusedCopied(model: *Model, result: native_sdk.EffectClipboardResult) void {
+    if (result.key != refused_text_clip_key or !g_refused_copy_out) return;
+    g_refused_copy_out = false;
+    const copied = result.outcome == .ok;
+    for (g_refused[0..g_refused_len]) |*r| {
+        if (copied and r.copying) r.drop = true;
+        r.copying = false;
+    }
+    if (!copied) return setToast(model, "Not copied. They are still kept here.");
+    compactRefused();
     // The warning cannot ride on the clipboard, so it is said instead.
-    setToast(model, if (warned) "Copied. Set its content warning again." else "Copied");
+    setToast(model, if (g_refused_copy_warned) "Copied. Set its content warning again." else "Copied");
 }
 
 /// Dismiss: lets go of every text kept for this box.
 pub fn dismissRefused(model: *const Model, box: RefusedBox) void {
-    dropRefused(box, refusedRoot(model, box));
+    const root = refusedRoot(model, box);
+    for (g_refused[0..g_refused_len]) |*r| {
+        if (refusedIsFor(r, box, root)) r.drop = true;
+    }
+    compactRefused();
 }
 
-fn dropRefused(box: RefusedBox, root: [32]u8) void {
+fn compactRefused() void {
     var kept: usize = 0;
     for (0..g_refused_len) |i| {
-        if (refusedIsFor(&g_refused[i], box, root)) continue;
+        if (g_refused[i].drop) continue;
         if (kept != i) g_refused[kept] = g_refused[i];
         kept += 1;
     }
@@ -431,6 +467,8 @@ pub fn forgetRefused() void {
         r.* = .{};
     }
     g_refused_len = 0;
+    g_refused_copy_out = false;
+    g_refused_copy_warned = false;
 }
 
 /// The texts kept aside, oldest first, for a test of what is held and where.
