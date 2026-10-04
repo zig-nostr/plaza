@@ -6773,9 +6773,11 @@ pub const sweepOutbox = outbox.sweepOutbox;
 pub const syncOutboxOwner = outbox.syncOutboxOwner;
 
 // re-exports: people_search.zig
+pub const claimSearchSlotForTest = people_search.claimSearchSlotForTest;
 pub const handleNip05FoundForTest = people_search.handleNip05FoundForTest;
 pub const nip05AskKeyForTest = people_search.nip05AskKeyForTest;
 pub const nip05AskedForTest = people_search.nip05AskedForTest;
+pub const releaseSearchSlotForTest = people_search.releaseSearchSlotForTest;
 pub const searchAcceptForTest = people_search.searchAcceptForTest;
 pub const searchArrivedForTest = people_search.searchArrivedForTest;
 pub const searchAskedForTest = people_search.searchAskedForTest;
@@ -6789,6 +6791,7 @@ pub const searchRowCountForTest = people_search.searchRowCountForTest;
 pub const searchRowLocalForTest = people_search.searchRowLocalForTest;
 pub const searchRowPubkeyForTest = people_search.searchRowPubkeyForTest;
 pub const searchRowRelaysForTest = people_search.searchRowRelaysForTest;
+pub const searchSendCurrentForTest = people_search.searchSendCurrentForTest;
 pub const searchSetStatusForTest = people_search.searchSetStatusForTest;
 pub const searchTickForTest = people_search.searchTickForTest;
 pub const search_inbox_cap_for_test = people_search.search_inbox_cap_for_test;

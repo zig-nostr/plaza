@@ -293,6 +293,46 @@ test "a key, a signer link or a web link typed into search never leaves the mach
     try testing.expect(!main.searchAskedForTest());
 }
 
+test "a search relay has one thread out at a time, and is asked again once it is free" {
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+
+    // The first term takes relay 0.
+    try testing.expect(main.claimSearchSlotForTest(0, 5));
+    // The reader types on while that thread is still dialling: no second thread
+    // for the same relay, however many terms settle meanwhile. The others are
+    // their own.
+    try testing.expect(!main.claimSearchSlotForTest(0, 6));
+    try testing.expect(!main.claimSearchSlotForTest(0, 7));
+    try testing.expect(main.claimSearchSlotForTest(1, 7));
+    // Once it has gone, the term on screen is put to it, once.
+    main.releaseSearchSlotForTest(0);
+    try testing.expect(main.claimSearchSlotForTest(0, 7));
+    main.releaseSearchSlotForTest(0);
+    try testing.expect(!main.claimSearchSlotForTest(0, 7));
+    main.releaseSearchSlotForTest(1);
+}
+
+test "a search term replaced while the socket opened is never sent" {
+    main.searchResetForTest();
+    defer main.searchResetForTest();
+    const Sender = struct {
+        sent: *usize,
+        pub fn send(self: @This(), text: []const u8) !void {
+            _ = text;
+            self.sent.* += 1;
+        }
+    };
+    var sent: usize = 0;
+    const gen = main.searchGenForTest();
+    try testing.expect(try main.searchSendCurrentForTest(gen, Sender{ .sent = &sent }, "req"));
+    try testing.expectEqual(@as(usize, 1), sent);
+    // The reader cleared the field, or typed something else, during the dial.
+    main.searchResetForTest();
+    try testing.expect(!try main.searchSendCurrentForTest(gen, Sender{ .sent = &sent }, "req"));
+    try testing.expectEqual(@as(usize, 1), sent);
+}
+
 test "a key pasted with a character too many still never leaves the machine" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

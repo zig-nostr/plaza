@@ -100,6 +100,28 @@ pub var g_search_asked: u32 = 0;
 pub var g_search_typed_ms: i64 = 0;
 /// Where each search relay stands, as a packed `search.Status`.
 pub var g_search_status: [search.relays_max]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
+/// The generation each search relay has been put, so a relay that was busy when
+/// the term settled is asked once it is free.
+var g_search_slot_asked: [search.relays_max]u32 = @splat(0);
+/// Whether a thread is out for each search relay. The dial has no deadline of
+/// its own, so a relay that never completes the handshake parks its thread
+/// before the read budget starts; a fresh thread per settled term on top of
+/// that grew without bound while the reader typed.
+var g_search_live: [search.relays_max]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false));
+
+/// Takes search relay `i` for generation `gen`: false when it has already been
+/// put this term, or when its previous thread is still out, in which case a
+/// later tick asks again.
+fn claimSearchSlot(i: usize, gen: u32) bool {
+    if (g_search_slot_asked[i] == gen) return false;
+    if (g_search_live[i].swap(true, .acq_rel)) return false;
+    g_search_slot_asked[i] = gen;
+    return true;
+}
+
+fn releaseSearchSlot(i: usize) void {
+    g_search_live[i].store(false, .release);
+}
 
 /// A person a relay returned, on its way from the thread that read it to the one
 /// that draws it.
@@ -380,29 +402,52 @@ pub const SearchJob = struct {
     term_len: u8,
 };
 
-/// Puts the term on screen to the search relays, once per term.
+/// Puts the term on screen to the search relays, once per term and relay. Runs
+/// every tick while the term stands: a relay whose previous thread was still
+/// out is asked here once that thread has gone.
 fn searchAskRelays() void {
     const gen = g_search_gen.load(.acquire);
-    if (g_search_term_len == 0 or g_search_asked == gen) return;
+    if (g_search_term_len == 0) return;
     g_search_asked = gen;
     if (!relayFetchAllowed()) return;
     const urls = searchRelays();
     for (urls, 0..) |url, i| {
         if (i >= search.relays_max) break;
+        if (g_search_slot_asked[i] == gen) continue;
         if (relaysPaused()) {
+            g_search_slot_asked[i] = gen;
             g_search_status[i].store((search.Status{ .gen = gen, .state = .paused, .count = 0 }).pack(), .release);
             continue;
         }
+        if (!claimSearchSlot(i, gen)) continue;
         g_search_status[i].store((search.Status{ .gen = gen, .state = .asking, .count = 0 }).pack(), .release);
         var job = SearchJob{ .gen = gen, .relay = @intCast(i), .url = url, .term = undefined, .term_len = @intCast(g_search_term_len) };
         @memcpy(job.term[0..g_search_term_len], g_search_term[0..g_search_term_len]);
         const thread = std.Thread.spawn(.{}, searchRelayWorker, .{job}) catch {
+            releaseSearchSlot(i);
             g_search_status[i].store((search.Status{ .gen = gen, .state = .unreachable_, .count = 0 }).pack(), .release);
             continue;
         };
         thread.detach();
     }
 }
+
+/// Sends a search request, unless the term has moved on while the socket
+/// opened. The dial can take seconds, and a term the reader has since replaced
+/// or cleared is not theirs to send any more. False when nothing was sent.
+fn searchSendCurrent(job: SearchJob, sender: anytype, request: []const u8) !bool {
+    if (g_search_gen.load(.acquire) != job.gen) return false;
+    try sender.send(request);
+    return true;
+}
+
+/// `searchSendCurrent`'s way onto a live connection.
+const SearchRelaySender = struct {
+    relay: *nostr.relay.Relay,
+    fn send(self: SearchRelaySender, text: []const u8) !void {
+        return search.sendText(self.relay, text);
+    }
+};
 
 /// Publishes a relay's outcome, unless the term has moved on.
 fn searchPublish(job: SearchJob, state: search.RelayState, count: u16) void {
@@ -432,6 +477,7 @@ pub fn searchArrived(gen: u32, relay: u8, pubkey: [32]u8) void {
 
 /// Asks one search relay for profiles matching the term, on its own thread.
 fn searchRelayWorker(job: SearchJob) void {
+    defer releaseSearchSlot(job.relay);
     const gpa = std.heap.page_allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -454,7 +500,7 @@ fn searchRelayWorker(job: SearchJob) void {
     defer releaseOneShot(watched);
     const request = search.requestText(gpa, job.term[0..job.term_len]) catch return;
     defer gpa.free(request);
-    search.sendText(relay, request) catch return;
+    if (!(searchSendCurrent(job, SearchRelaySender{ .relay = relay }, request) catch return)) return;
     // Asked. From here a relay that never says anything is a quiet one, not one
     // that could not be reached.
     state = .silent;
@@ -649,8 +695,25 @@ pub fn searchResetForTest() void {
     g_search_index_ready = false;
     unlockSearchIndex();
     g_search_asked = 0;
+    g_search_slot_asked = @splat(0);
+    for (&g_search_live) |*live| live.store(false, .release);
     g_search_typed_ms = 0;
     g_nip05_ask = null;
+}
+
+pub fn claimSearchSlotForTest(i: usize, gen: u32) bool {
+    return claimSearchSlot(i, gen);
+}
+
+pub fn releaseSearchSlotForTest(i: usize) void {
+    releaseSearchSlot(i);
+}
+
+/// Whether a request built for generation `gen` would go out now, through
+/// `sender`, a test's stand-in for the connection.
+pub fn searchSendCurrentForTest(gen: u32, sender: anytype, request: []const u8) !bool {
+    const job = SearchJob{ .gen = gen, .relay = 0, .url = "", .term = undefined, .term_len = 0 };
+    return searchSendCurrent(job, sender, request);
 }
 
 /// Builds the index now, on this thread, from the store.
