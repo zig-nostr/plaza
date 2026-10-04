@@ -15,6 +15,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const plazaIngestFrom = main.plazaIngestFrom;
 const putBackRefusedReply = main.putBackRefusedReply;
 const Effects = main.Effects;
 const Model = main.Model;
@@ -149,6 +150,55 @@ const profile_filter_kinds = [_]u16{ 0, relay_list_kind };
 /// author and three records, so it costs nothing to ask for separately, which
 /// is the entire reason the bulk filter above can stop asking for it.
 const self_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind, mute_list_kind, bookmark_list_kind, blossom_list_kind };
+
+/// Whether one relay's answer about the reader's own records can be read as
+/// "that is all I have".
+///
+/// An EOSE says the relay sent everything it holds. It does not say Plaza kept
+/// it. One of the reader's own records that arrived and could not be stored, or
+/// did not verify, or a message that could not be read at all, is a record
+/// that may be the very list this relay holds. Counting the EOSE then reads a
+/// list that arrived as a list that does not exist, and the new-list question
+/// replaces it.
+pub const SelfRead = struct {
+    unread: bool = false,
+
+    /// An event on the question's subscription, and whether it made it into
+    /// the store. Only the reader's own records of the kinds asked about count.
+    pub fn sawEvent(self: *SelfRead, ev: nostr.event.Event, me: [32]u8, stored: bool) void {
+        if (stored) return;
+        if (!std.mem.eql(u8, &ev.pubkey, &me)) return;
+        if (std.mem.indexOfScalar(u16, &self_filter_kinds, ev.kind) == null) return;
+        self.unread = true;
+    }
+
+    /// A message that arrived and could not be read. Whose it was cannot be
+    /// known, so it may have been the reader's.
+    pub fn sawUnreadable(self: *SelfRead) void {
+        self.unread = true;
+    }
+
+    /// Whether this relay's end of stored events answers the question.
+    pub fn eoseAnswers(self: SelfRead) bool {
+        return !self.unread;
+    }
+};
+
+pub const SelfReadForTest = SelfRead;
+
+/// One event on the feed subscription, verified and stored, and noted against
+/// `self_read` when it is one of the reader's own records that was not. Null
+/// when it was not stored.
+pub fn ingestFeedEvent(gpa: std.mem.Allocator, signer: nostr.keys.Signer, url: []const u8, ev: nostr.event.Event, asked_about: ?[32]u8, self_read: *SelfRead) ?nostr.store.IngestResult {
+    const result: ?nostr.store.IngestResult = plazaIngestFrom(gpa, ev, .{ .verify_with = signer }, url) catch null;
+    const stored = if (result) |r| r != .invalid else false;
+    if (asked_about) |me| self_read.sawEvent(ev, me, stored);
+    return if (stored) result else null;
+}
+
+pub fn ingestFeedEventForTest(gpa: std.mem.Allocator, signer: nostr.keys.Signer, ev: nostr.event.Event, asked_about: ?[32]u8, self_read: *SelfRead) bool {
+    return ingestFeedEvent(gpa, signer, "wss://relay.example", ev, asked_about, self_read) != null;
+}
 
 /// Splits `authors` across filters small enough for a relay to accept, two per
 /// chunk, and returns the slice of `out` that was filled.

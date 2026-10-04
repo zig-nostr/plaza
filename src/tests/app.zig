@@ -2930,6 +2930,9 @@ test "every relay-fed note ingest remembers which relay it came from" {
         while (it.next()) |line| {
             if (std.mem.indexOf(u8, line, "plazaIngest(gpa, e.event, .{ .verify_with = signer })") != null) bare += 1;
             if (std.mem.indexOf(u8, line, "plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, ") != null) from += 1;
+            // The feed's own events go through `ingestFeedEvent`, which hands the
+            // relay on in the same way.
+            if (std.mem.indexOf(u8, line, "plazaIngestFrom(gpa, ev, .{ .verify_with = signer }, url)") != null) from += 1;
         }
     }
     try testing.expectEqual(@as(usize, 6), bare);

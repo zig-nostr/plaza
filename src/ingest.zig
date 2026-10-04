@@ -13,6 +13,8 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const ingestFeedEvent = main.ingestFeedEvent;
+const SelfRead = main.SelfRead;
 const AuthSession = main.AuthSession;
 const Note = main.Note;
 const activePubkey = main.activePubkey;
@@ -535,6 +537,9 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // the reader's own lists before it had sent them. See `isFeedSub`.
     var feed_sub_buf: [32]u8 = undefined;
     var feed_sub: []const u8 = feed_sub_base;
+    // What the current feed subscription failed to keep of the reader's own
+    // records. Starts over with every re-issue, as the question does.
+    var self_read: SelfRead = .{};
     if (reads) try relay.subscribe(feed_sub, filters);
 
     // Latency is measured with a PROBE, never with the subscriptions above: the
@@ -616,6 +621,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
             // place, so the old question's answers stay its own.
             relay.unsubscribe(feed_sub) catch {};
             feed_sub = std.fmt.bufPrint(&feed_sub_buf, feed_sub_base ++ "-{d}", .{subscribed_gen}) catch feed_sub_base;
+            self_read = .{};
             relay.subscribe(feed_sub, next_filters) catch {};
             // The inbox rides the SAME signal, and for a reason the feed's own
             // comment above already explains: this counter moves on sign-in.
@@ -736,13 +742,18 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     continue;
                 }
                 if (isFeedSub(e.subscription_id)) {
-                    // Verify (secp256k1) before storing; silently drop a bad event.
+                    // Verify (secp256k1) before storing; drop a bad event.
                     // `.invalid` is a RETURNED VALUE here, not an error: a
                     // forged event does not throw, it comes back saying it did
                     // not verify. Reading only the error channel let a relay
                     // hand this reader a relay list signed by nobody.
-                    const result = plazaIngestFrom(gpa, e.event, .{ .verify_with = signer }, url) catch continue;
-                    if (result == .invalid) continue;
+                    //
+                    // Dropped, but not silently when it was one of the reader's
+                    // own records on the current question: this relay's EOSE
+                    // then no longer says it has none.
+                    const current = std.mem.eql(u8, e.subscription_id, feed_sub);
+                    var ignored: SelfRead = .{};
+                    _ = ingestFeedEvent(gpa, signer, url, e.event, asked_about, if (current) &self_read else &ignored) orelse continue;
                     // Note which relay carried it, so a thread can say how widely
                     // a note is held rather than guess.
                     if (e.event.kind == 1) {
@@ -806,7 +817,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                             // EOSE means "that is all I have", never "you have
                             // none": one relay that does not carry this list
                             // must not be able to authorize replacing it.
-                            if (std.mem.eql(u8, &asked, &me) and std.mem.eql(u8, eo.subscription_id, feed_sub)) {
+                            if (std.mem.eql(u8, &asked, &me) and std.mem.eql(u8, eo.subscription_id, feed_sub) and self_read.eoseAnswers()) {
                                 noteContactsAnsweredBy(index, url, me);
                             }
                         }

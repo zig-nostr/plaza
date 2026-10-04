@@ -6149,6 +6149,10 @@ pub const startedFresh = own_lists.startedFresh;
 pub const takeFresh = own_lists.takeFresh;
 
 // re-exports: follows.zig
+pub const ingestFeedEventForTest = follows.ingestFeedEventForTest;
+pub const ingestFeedEvent = follows.ingestFeedEvent;
+pub const SelfReadForTest = follows.SelfReadForTest;
+pub const SelfRead = follows.SelfRead;
 pub const applyUndoForTest = follows.applyUndoForTest;
 pub const armUndoForTest = follows.armUndoForTest;
 pub const armUnlikeUndoForTest = follows.armUnlikeUndoForTest;

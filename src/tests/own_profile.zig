@@ -701,6 +701,58 @@ test "a public bookmark waits for a private one being sealed, and the other way 
     try testing.expectEqual(main.BookmarkWrite.signer_busy, main.writeBookmarkForTest(&fx, [_]u8{0xe7} ** 32, true));
 }
 
+test "a relay that sent the reader's list and Plaza could not keep it has not said there is none" {
+    // The feed's EOSE counted as "this relay has finished without your list"
+    // even when one of the reader's own records had arrived on that very
+    // subscription and been dropped: a store error, or a signature that did not
+    // verify. A list one relay really holds then looked absent, and the
+    // new-list question would replace it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fs: FreshStore = undefined;
+    try fs.open("selfread");
+    defer fs.close();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const me = try signer.keyPairFromSecretKey([_]u8{0x88} ** 32);
+    const stranger = try signer.keyPairFromSecretKey([_]u8{0x89} ** 32);
+
+    // The reader's own mute list, stored: an answer.
+    {
+        var read: main.SelfReadForTest = .{};
+        const ok = try nostr.event.create(arena, signer, me, 1_800_000_000, 10000, &.{}, "", null);
+        try testing.expect(main.ingestFeedEventForTest(arena, signer, ok, me.public_key, &read));
+        try testing.expect(read.eoseAnswers());
+    }
+    // The reader's own mute list, arriving and not verifying: not an answer.
+    {
+        var read: main.SelfReadForTest = .{};
+        var bad = try nostr.event.create(arena, signer, me, 1_800_000_001, 10000, &.{}, "", null);
+        bad.sig[0] ^= 0xff;
+        try testing.expect(!main.ingestFeedEventForTest(arena, signer, bad, me.public_key, &read));
+        try testing.expect(!read.eoseAnswers());
+    }
+    // A stranger's bad list, or the reader's bad note, says nothing about the
+    // reader's lists.
+    {
+        var read: main.SelfReadForTest = .{};
+        var theirs = try nostr.event.create(arena, signer, stranger, 1_800_000_002, 10000, &.{}, "", null);
+        theirs.sig[0] ^= 0xff;
+        _ = main.ingestFeedEventForTest(arena, signer, theirs, me.public_key, &read);
+        var note = try nostr.event.create(arena, signer, me, 1_800_000_003, 1, &.{}, "hello", null);
+        note.sig[0] ^= 0xff;
+        _ = main.ingestFeedEventForTest(arena, signer, note, me.public_key, &read);
+        try testing.expect(read.eoseAnswers());
+    }
+    // And a message that could not be read at all may have been the list.
+    {
+        var read: main.SelfReadForTest = .{};
+        read.sawUnreadable();
+        try testing.expect(!read.eoseAnswers());
+    }
+}
+
 test "a seal that comes back the wrong length is not published" {
     // Whatever cut or mangled it, a ciphertext that is not the length this
     // plaintext seals to would replace every private bookmark with bytes

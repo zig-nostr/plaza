@@ -15,6 +15,7 @@ const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
 // ---- from main.zig
+const SelfRead = main.SelfRead;
 const Effects = main.Effects;
 const Model = main.Model;
 const activePubkey = main.activePubkey;
@@ -564,6 +565,10 @@ pub fn askVerdict(msg: nostr.message.RelayMessage) AskVerdict {
 }
 fn ownProfileWorker(pk: [32]u8) void {
     var answered = false;
+    // A profile that arrived from any relay and could not be read or stored
+    // means the round has not shown there is none, however many relays said
+    // EOSE. Otherwise "Publish first profile" is offered over it.
+    var self_read: SelfRead = .{};
     defer {
         // ANSWERED, not merely attempted. A round where every relay was offline,
         // write-only, or refused the dial proves nothing about the account, and
@@ -571,7 +576,7 @@ fn ownProfileWorker(pk: [32]u8) void {
         // with an empty one.
         lockOwnProfile();
         g_own_profile_asked_for = pk;
-        g_own_profile_answered.store(answered, .release);
+        g_own_profile_answered.store(answered and self_read.eoseAnswers(), .release);
         unlockOwnProfile();
         g_own_profile_asking.store(false, .release);
     }
@@ -598,7 +603,13 @@ fn ownProfileWorker(pk: [32]u8) void {
         relay.subscribe("plaza-me", &filters) catch continue;
         var seen: usize = 0;
         while (seen < 32) : (seen += 1) {
-            var msg = (relay.receive() catch break) orelse break;
+            var msg = (relay.receive() catch |err| {
+                // A message that arrived and could not be parsed. This
+                // connection cannot read past it, and it may have been the
+                // profile.
+                if (err == error.InvalidMessage) self_read.sawUnreadable();
+                break;
+            }) orelse break;
             defer msg.deinit();
             // Only an EOSE is an answer: "that is all I have". A CLOSED ends
             // this relay's part of the question and says nothing about the
@@ -615,13 +626,19 @@ fn ownProfileWorker(pk: [32]u8) void {
             }
             switch (msg.value) {
                 .event => |e| {
-                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
+                    const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {
+                        self_read.sawEvent(e.event, pk, false);
+                        continue;
+                    };
                     // A relay can send ANY event down any subscription, so the
                     // event has to be the thing that was asked for before it can
                     // count as an answer about it. Verified was not enough: a
                     // valid note from a stranger, pushed down "plaza-me", used to
                     // decide that this account had no profile.
-                    if (result == .invalid) continue;
+                    if (result == .invalid) {
+                        self_read.sawEvent(e.event, pk, false);
+                        continue;
+                    }
                     if (e.event.kind != 0) continue;
                     if (!std.mem.eql(u8, &e.event.pubkey, &pk)) continue;
                     answered = true;
