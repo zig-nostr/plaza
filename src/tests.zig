@@ -7489,9 +7489,10 @@ test "no follow is written before a relay has said who you already follow" {
     for (0..5) |i| main.noteContactsAnsweredByForTest(i, me);
     try testing.expect(!main.canWriteFollows());
     try testing.expect(!main.writeFollowForTest(&fx, someone, true));
-    // It makes the press ask instead: see "pressing Follow when every relay
-    // finished empty asks first".
-    try testing.expect(main.needsFreshConsentForTest(.follows));
+    // Nor does it put the question: the reader's own relays have not been named,
+    // so "every relay finished" is not true of the relays that matter.
+    try testing.expect(!main.needsFreshConsentForTest(.follows));
+    try testing.expect(main.followBlockedReason() != null);
 
     // A key MINTED here is different in kind: it provably has no history, so
     // there is nothing a write could destroy.
@@ -8254,10 +8255,11 @@ test "an imported key is never assumed to follow nobody, however quiet the relay
     main.setIdentityMintedForTest(false);
     for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
     try testing.expect(!main.canWriteFollows());
-    // The answers are not a licence to write. They make the press ask: the
-    // reader is the one party who can say the list is not somewhere unlooked.
-    try testing.expect(main.needsFreshConsentForTest(.follows));
-    try testing.expect(!main.canWriteFollows());
+    // The answers are not a licence to write, and with no relay list for this
+    // reader they are not even grounds to ask: the relays that answered are the
+    // app's, not theirs.
+    try testing.expect(!main.needsFreshConsentForTest(.follows));
+    try testing.expectEqualStrings("Looking for your follow list…", main.followBlockedReason().?);
 
     // A key minted here is the one case where "no list" is knowledge, not a
     // guess, because the key did not exist a minute ago.
@@ -8346,8 +8348,21 @@ test "follow, mute and bookmark say what is wrong once the wait runs out, and ca
         try testing.expect(findByText(tree.root, .button, "Try again") == null);
     }
 
-    // Every relay finished and none had a list: said plainly, still no write.
+    // Every relay finished and none had a list. Not yet "none found": nothing
+    // has said where this reader's lists are kept, and the pool is the app's
+    // own bootstrap relays.
     for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
+    try testing.expectEqual(main.OwnListsRead.reading, main.ownListsRead());
+    main.ownListsWaitedForTest(60);
+    try testing.expectEqual(main.OwnListsRead.incomplete, main.ownListsRead());
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContaining(tree.root, "has not found your relay list"));
+        try testing.expect(findByText(tree.root, .button, "Try again") != null);
+    }
+    // Their relay list arrives and the relays they write to are the ones that
+    // finished: said plainly, still no write.
+    try ownRelayListIsThePool(0x68, &.{});
     try testing.expectEqual(main.OwnListsRead.none_found, main.ownListsRead());
     // The controls are live and the press asks first; none of it can write.
     try testing.expect(main.followBlockedReason() == null);
@@ -8427,8 +8442,29 @@ fn signInNothingFound(secret_byte: u8) [32]u8 {
     main.resetRelaysForTest();
     main.setIdentityMintedForTest(false);
     const me = main.activePubkeyForTest().?;
+    ownRelayListIsThePool(secret_byte, &.{}) catch unreachable;
     for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
     return me;
+}
+
+/// Gives the signed-in test account (secret `secret_byte`) a kind:10002 whose
+/// write relays are the pool's, plus `extra`, so that every relay finishing can
+/// mean every relay that could hold its lists.
+fn ownRelayListIsThePool(secret_byte: u8, extra: []const []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{secret_byte} ** 32);
+    var tags = std.ArrayList(nostr.event.Tag).empty;
+    for (0..8) |i| {
+        if (main.relayAt(i) == null) continue;
+        try tags.append(arena, try arena.dupe([]const u8, &.{ "r", main.relayUrlAt(i) }));
+    }
+    for (extra) |url| try tags.append(arena, try arena.dupe([]const u8, &.{ "r", url, "write" }));
+    const ev = try nostr.event.create(arena, signer, kp, 1_700_000_000, 10002, tags.items, "", null);
+    main.noteOwnOutboxForTest(ev);
 }
 
 test "pressing Follow when every relay finished empty asks first, and writes only on a yes" {
@@ -8646,7 +8682,7 @@ test "a first profile is published only after a second, informed press" {
     var other = main.initialModel();
     other.profile_stage = .absent;
     try testing.expect(!other.profile_can_save());
-    try testing.expect(std.mem.indexOf(u8, other.profile_status(), "Some relays did not answer") != null);
+    try testing.expect(std.mem.indexOf(u8, other.profile_status(), "not every relay that may keep one answered") != null);
 }
 
 test "every status the Edit profile sheet can show fits the two lines it has room for" {
@@ -8672,7 +8708,10 @@ test "every status the Edit profile sheet can show fits the two lines it has roo
             switch (relays) {
                 0 => {},
                 1 => main.ownListsWaitedForTest(60),
-                else => for (0..8) |i| main.noteContactsAnsweredByForTest(i, me),
+                else => {
+                    try ownRelayListIsThePool(0x71, &.{});
+                    for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
+                },
             }
             for (stages) |stage| {
                 for ([_]bool{ false, true }) |confirming| {
@@ -8683,6 +8722,288 @@ test "every status the Edit profile sheet can show fits the two lines it has roo
             }
         }
     }
+}
+
+test "the app's own relays finishing never starts a list for a reader whose relays are unknown" {
+    // A cold import dials the bootstrap relays. All of them finishing without a
+    // list says nothing about the relays this reader actually writes to, which
+    // nobody has named yet. No question is put, a yes left over from somewhere
+    // writes nothing, and the profile sheet stays shut.
+    var fs: FreshStore = undefined;
+    try fs.open("norelaylist");
+    defer fs.close();
+    main.setIdentityForTest([_]u8{0x72} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    main.forgetOwnRecordAnswersForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    main.setIdentityMintedForTest(false);
+    const me = main.activePubkeyForTest().?;
+    for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
+    try testing.expect(main.contactsConfirmedAbsentForTest());
+    main.ownListsWaitedForTest(60);
+
+    try testing.expectEqual(main.OwnListsRead.incomplete, main.ownListsRead());
+    try testing.expect(!main.needsFreshConsentForTest(.follows));
+    try testing.expect(!main.confirmStartFreshForTest(.follows));
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    const bob = [_]u8{0xb6} ** 32;
+    main.update(&model, Msg{ .follow_author = .{ .who = bob, .direction = 1 } }, &fx);
+    try testing.expect(model.fresh_ask == null);
+    model.fresh_ask = .{ .action = .follow, .who = bob, .of = me };
+    main.update(&model, .fresh_list_confirm, &fx);
+    try testing.expect(main.ownRecordTagsJoinedForTest(testing.allocator, 3) == null);
+
+    var sheet = main.initialModel();
+    sheet.profile_stage = .absent;
+    sheet.profile_name_buffer.set("Nobody");
+    try testing.expect(!sheet.profile_can_save());
+}
+
+test "a relay the reader writes to that Plaza does not read keeps the read open" {
+    // NIP-65 puts the lists on the write relays. One that is not in the pool, or
+    // is in it marked write-only, is never asked, so its silence is not an answer.
+    const me = signInNothingFound(0x73);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+    try testing.expectEqual(main.OwnListsRead.none_found, main.ownListsRead());
+
+    main.forgetOwnRecordAnswersForTest();
+    const theirs = "wss://only-theirs.example";
+    try ownRelayListIsThePool(0x73, &.{theirs});
+    for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
+    main.ownListsWaitedForTest(60);
+    try testing.expectEqual(main.OwnListsRead.incomplete, main.ownListsRead());
+    try testing.expect(!main.confirmStartFreshForTest(.mutes));
+
+    // In the pool but write-only: still never asked.
+    const seat = main.addRelayForTest(theirs, false, true) orelse return error.PoolFull;
+    try testing.expect(!main.ownRelaysAllFinishedForTest());
+    {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        var model = main.initialModel();
+        model.stage = .ready;
+        model.viewing_profile = [_]u8{0x5d} ** 32;
+        const tree = try buildTree(arena_state.allocator(), &model);
+        try testing.expect(findAnyTextContaining(tree.root, "does not read from every relay you write to"));
+    }
+
+    // Read from, and finished: now every relay that could hold a list has said so.
+    main.cycleRelayForTest(seat);
+    try testing.expect(main.relayAt(seat).?.read);
+    try testing.expect(!main.ownRelaysAllFinishedForTest());
+    main.noteContactsAnsweredByForTest(seat, me);
+    try testing.expect(main.ownRelaysAllFinishedForTest());
+}
+
+test "an answer from a relay that left its seat does not count for the relay that took it" {
+    // Adopting the reader's relay list, or removing one relay and adding another,
+    // seats a different relay at the same index. The answer the old one gave is
+    // about the old one.
+    main.setIdentityForTest([_]u8{0x74} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    main.forgetOwnRecordAnswersForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    main.setIdentityMintedForTest(false);
+    const me = main.activePubkeyForTest().?;
+
+    const old_url = try testing.allocator.dupe(u8, main.relayUrlAt(0));
+    defer testing.allocator.free(old_url);
+    main.removeRelayForTest(0);
+    const newcomer = "wss://took-the-seat.example";
+    try testing.expectEqual(@as(?usize, 0), main.addRelayForTest(newcomer, true, true));
+    try ownRelayListIsThePool(0x74, &.{});
+
+    // The relay that used to sit there answered just before it left.
+    main.noteContactsAnsweredFromForTest(0, old_url, me);
+    for (1..8) |i| main.noteContactsAnsweredByForTest(i, me);
+    try testing.expect(!main.ownRelaysAllFinishedForTest());
+    try testing.expect(!main.confirmStartFreshForTest(.follows));
+
+    // The relay sitting there now answers for itself.
+    main.noteContactsAnsweredByForTest(0, me);
+    try testing.expect(main.ownRelaysAllFinishedForTest());
+}
+
+test "a yes is never spent on an account other than the one it was asked about" {
+    var fs: FreshStore = undefined;
+    try fs.open("switchyes");
+    defer fs.close();
+    _ = signInNothingFound(0x75);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    const bob = [_]u8{0xb7} ** 32;
+    main.update(&model, Msg{ .follow_author = .{ .who = bob, .direction = 1 } }, &fx);
+    try testing.expect(model.fresh_ask != null);
+
+    // Another account signs in while the question is open, and it too has every
+    // relay finished with nothing. The yes was about the first one.
+    _ = signInNothingFound(0x76);
+    try testing.expect(main.needsFreshConsentForTest(.follows));
+    main.update(&model, .fresh_list_confirm, &fx);
+    try testing.expect(model.fresh_ask == null);
+    try testing.expect(main.ownRecordTagsJoinedForTest(testing.allocator, 3) == null);
+    try testing.expect(!main.noHistoryKnownForTest(.follows));
+}
+
+test "a list that arrives while the question is open is spliced onto, and arms nothing" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fs: FreshStore = undefined;
+    try fs.open("latelist");
+    defer fs.close();
+    _ = signInNothingFound(0x77);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    const bob = [_]u8{0xb8} ** 32;
+    main.update(&model, Msg{ .follow_author = .{ .who = bob, .direction = 1 } }, &fx);
+    try testing.expect(model.fresh_ask != null);
+
+    // The real list, late, from a relay that had been slow.
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x77} ** 32);
+    const tags = [_]nostr.event.Tag{&.{ "p", "12" ** 32 }};
+    const real = try nostr.event.create(arena, signer, kp, 1_800_000_000, 3, &tags, "", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, real, signer);
+    main.forgetOwnListMemoForTest();
+
+    main.update(&model, .fresh_list_confirm, &fx);
+    const written = main.ownRecordTagsJoinedForTest(testing.allocator, 3) orelse return error.NothingWritten;
+    defer testing.allocator.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, "12" ** 32) != null);
+    try testing.expect(std.mem.indexOf(u8, written, "b8" ** 32) != null);
+    // No yes was recorded: a later empty read is refused, not a fresh start.
+    try testing.expect(!main.noHistoryKnownForTest(.follows));
+}
+
+test "one yes starts one list, and a later empty read is refused rather than a second start" {
+    var fs: FreshStore = undefined;
+    try fs.open("oneyes");
+    defer fs.close();
+    _ = signInNothingFound(0x78);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_profile = [_]u8{0x5c} ** 32;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .mute_person = 1 }, &fx);
+    main.update(&model, .fresh_list_confirm, &fx);
+    const muted = main.ownRecordTagsJoinedForTest(testing.allocator, 10000) orelse return error.NothingWritten;
+    testing.allocator.free(muted);
+    try testing.expect(!main.noHistoryKnownForTest(.mutes));
+
+    // The store cannot be read for a moment. The list started a second ago is
+    // still out there; a write now would replace it with a list of one.
+    main.setStoreForTest(null);
+    defer main.setStoreForTest(&fs.store);
+    try testing.expectEqual(main.MuteWrite.no_list_yet, main.writeMuteForTest(&fx, [_]u8{0x5b} ** 32, true));
+}
+
+test "a profile that lands between the two presses is shown, not merged over" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fs: FreshStore = undefined;
+    try fs.open("lateprofile");
+    defer fs.close();
+    _ = signInNothingFound(0x79);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+
+    var model = main.initialModel();
+    model.stage = .settings;
+    model.editing_profile = true;
+    model.profile_stage = .absent;
+    model.profile_name_buffer.set("Fresh");
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .profile_save, &fx);
+    try testing.expect(model.profile_confirm_new);
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x79} ** 32);
+    const real_json = "{\"name\":\"Real\",\"about\":\"keep me\",\"lud16\":\"pay@real.example\"}";
+    const real = try nostr.event.create(arena, signer, kp, 1_800_000_000, 0, &.{}, real_json, null);
+    _ = try main.plazaIngestVerifiedForTest(arena, real, signer);
+
+    // The press that would have published: it shows the profile instead.
+    main.update(&model, .profile_save, &fx);
+    try testing.expectEqual(main.ProfileStage.have, model.profile_stage);
+    try testing.expect(!model.profile_confirm_new);
+    const content = main.ownRecordContentForTest(testing.allocator, 0) orelse return error.ProfileGone;
+    defer testing.allocator.free(content);
+    try testing.expectEqualStrings(real_json, content);
+    try testing.expectEqualStrings("keep me", model.profile_about_buffer.text());
+    try testing.expectEqualStrings("pay@real.example", model.profile_lud16_buffer.text());
+}
+
+test "a private bookmark is not published over a list that landed while it was sealed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fs: FreshStore = undefined;
+    try fs.open("lateseal");
+    defer fs.close();
+    _ = signInNothingFound(0x7a);
+    defer main.clearIdentityForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+    defer main.forgetBookmarksForTest();
+    defer main.forgetPrivateHalvesForTest();
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_profile = [_]u8{0x5a} ** 32;
+    model.thread_notes[0] = threadNote(0x02, 100, 0);
+    model.thread_notes[0].id = 78;
+    model.thread_notes[0].pubkey = [_]u8{0x5a} ** 32;
+    model.thread_notes_len = 1;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, Msg{ .bookmark_privately = 78 }, &fx);
+    try testing.expect(model.fresh_ask != null);
+    // Yes: the seal goes out (inline in a test binary), and the list is not
+    // written until the ciphertext is back.
+    main.update(&model, .fresh_list_confirm, &fx);
+    try testing.expect(main.ownRecordTagsJoinedForTest(testing.allocator, 10003) == null);
+
+    // The real list lands in between, private half and all.
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x7a} ** 32);
+    const tags = [_]nostr.event.Tag{&.{ "e", "13" ** 32 }};
+    const real = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10003, &tags, "a-private-half-this-seal-never-saw", null);
+    _ = try main.plazaIngestVerifiedForTest(arena, real, signer);
+
+    main.finishPrivateBookmarkForTest(&model, &fx);
+    const content = main.ownRecordContentForTest(testing.allocator, 10003) orelse return error.ListGone;
+    defer testing.allocator.free(content);
+    try testing.expectEqualStrings("a-private-half-this-seal-never-saw", content);
+}
+
+test "only the feed subscription's own ids are read as the feed" {
+    try testing.expect(main.isFeedSubForTest("plaza-feed"));
+    try testing.expect(main.isFeedSubForTest("plaza-feed-12"));
+    try testing.expect(!main.isFeedSubForTest("plaza-inbox"));
+    try testing.expect(!main.isFeedSubForTest("plaza-engagement"));
+    try testing.expect(!main.isFeedSubForTest("plaza-ask-1"));
 }
 
 test "a write that would drop more names than the press implies is refused" {
@@ -17366,17 +17687,25 @@ test "a long follow list is split across filters that relays accept, in one REQ"
     // not read back, and the follow list is the one where getting that wrong
     // empties an account. Dropping kind:3 from the bulk filter is only safe
     // because this exists.
-    const me = [_]u8{0xC3} ** 32;
-    const with_me = main.buildFeedFilters(few, me, null, &buf);
-    try testing.expectEqual(@as(usize, 3), with_me.len);
-    const own = with_me[with_me.len - 1];
-    try testing.expectEqual(@as(usize, 1), own.authors.?.len);
-    try testing.expectEqualSlices(u8, &me, &own.authors.?[0]);
-    var asks_contacts = false;
-    for (own.kinds.?) |k| {
-        if (k == 3) asks_contacts = true;
+    const me = [_][32]u8{[_]u8{0xC3} ** 32};
+    const with_me = main.buildFeedFilters(few, &me, null, &buf);
+    // One filter per own kind, each limited to one record. A single filter with
+    // a limit of five let a relay holding old versions of the contact list fill
+    // the five with those and finish without sending the mute list.
+    // The media server list rides with them, so an upload knows where to go.
+    const own_kinds = [_]u16{ 0, 10002, 3, 10000, 10003, 10063 };
+    try testing.expectEqual(@as(usize, 2 + own_kinds.len), with_me.len);
+    for (own_kinds) |want| {
+        var found = false;
+        for (with_me[2..]) |own| {
+            try testing.expectEqual(@as(usize, 1), own.authors.?.len);
+            try testing.expectEqualSlices(u8, &me[0], &own.authors.?[0]);
+            try testing.expectEqual(@as(usize, 1), own.kinds.?.len);
+            try testing.expectEqual(@as(?u32, 1), own.limit);
+            if (own.kinds.?[0] == want) found = true;
+        }
+        try testing.expect(found);
     }
-    try testing.expect(asks_contacts);
 }
 
 test "a relay that keeps dropping is asked less and less often" {
@@ -33337,4 +33666,33 @@ test "a person found by name or by NIP-05 over Settings leaves Settings" {
         try testing.expectEqual(main.Stage.ready, model.stage);
         try testing.expectEqualSlices(u8, &([_]u8{0x4f} ** 32), &(model.viewing_profile orelse return error.NoProfile));
     }
+}
+
+test "a re-issued feed that a relay refuses for want of AUTH is asked again once the relay says yes" {
+    // The feed is closed and asked again under a new id each time its question
+    // changes (`plaza-feed-<generation>`), and sign-in is one of those times, so
+    // the feed a relay refuses for want of AUTH is almost never the bare
+    // `plaza-feed` any more. Matched by name alone, the refusal was not recorded
+    // as owed, nothing was re-sent after the relay accepted the reply, and that
+    // relay sent the reader no feed for the rest of the connection.
+    const idx = try authFixture();
+    defer authCleanup();
+    const me = main.activePubkeyForTest().?;
+    var rec = AuthRecorder{};
+    var fx: main.EffectsForTest = undefined;
+
+    try testing.expect(main.setAuthChoiceForTest(me, auth_test_url, .allow));
+    main.authSlotResetForTest(idx);
+    var sess = main.AuthSessionForTest{ .index = idx };
+    _ = main.authReactForTest(&sess, auth_test_url, authMsg("after-sign-in"), 0);
+    const refused = main.authReactForTest(&sess, auth_test_url, closedMsg("plaza-feed-7", "auth-required: log in"), 1);
+    try testing.expect(refused.handled);
+    try testing.expectEqualStrings("want_sign", main.authPhaseNameForTest(idx));
+    main.driveRelayAuthForTest(&fx);
+    _ = main.authPollForTest(&sess, auth_test_url, &rec, 2);
+    try testing.expectEqual(@as(usize, 1), rec.sent);
+    const ok = main.authReactForTest(&sess, auth_test_url, .{ .ok = .{ .event_id = rec.id, .accepted = true, .message = "" } }, 3);
+    try testing.expect(ok.resend.feed);
+    try testing.expect(!ok.resend.inbox);
+    try testing.expect(!ok.resend.engagement);
 }

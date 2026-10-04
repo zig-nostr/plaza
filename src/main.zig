@@ -1551,6 +1551,10 @@ fn adoptRelayList() bool {
 fn ingestRelayList(ev: nostr.event.Event) void {
     if (activePubkey()) |pk| {
         if (std.mem.eql(u8, &pk, &ev.pubkey)) {
+            // Where their lists live, recorded before anything below can refuse
+            // the event: a pool this account edited here still has to be checked
+            // against the relays they actually write to.
+            noteOwnOutbox(ev);
             // The event itself is what opens the write gate, and it does so by
             // being STORED rather than by being seen: `canWriteRelayList` asks
             // the store, so a publish always has the list it is splicing onto.
@@ -7115,6 +7119,20 @@ fn percentEncode(out: []u8, src: []const u8) ?[]const u8 {
 /// list of names precisely so a new question cannot land in the engagement
 /// branch and be counted as somebody liking something.
 const one_shot_sub_prefix = "plaza-ask-";
+
+/// The feed subscription's id, and the prefix every re-issue of it carries.
+const feed_sub_base = "plaza-feed";
+
+/// Whether `sub_id` is the feed subscription under any of its generations. Its
+/// events are stored whichever generation carried them; only the CURRENT one's
+/// end-of-stored-events says the relay has answered the question now asked.
+fn isFeedSub(sub_id: []const u8) bool {
+    return std.mem.startsWith(u8, sub_id, feed_sub_base);
+}
+
+pub fn isFeedSubForTest(sub_id: []const u8) bool {
+    return isFeedSub(sub_id);
+}
 
 fn isOneShotSub(sub_id: []const u8) bool {
     return std.mem.startsWith(u8, sub_id, one_shot_sub_prefix);
@@ -12799,7 +12817,7 @@ pub const Model = struct {
                 else
                     "No relay has a profile for you. If this account is new, Save publishes your first one.",
                 .reading => "Plaza has not found a profile yet and is still hearing from your relays.",
-                .incomplete => "Some relays did not answer, so Plaza cannot tell whether you have a profile. Try again.",
+                .incomplete => "Plaza cannot tell if you have a profile: not every relay that may keep one answered.",
             },
             // Deliberately NOT "you have no profile". Not hearing back is not
             // the same as being told there is nothing, and only one of those is
@@ -22965,9 +22983,9 @@ const follow_chunk = 500;
 /// a compile-time question rather than a truncated subscription.
 const max_follows_divided = (max_follows + 1 + follow_chunk - 1) / follow_chunk;
 
-/// How many filters the feed subscription can need: two per chunk, plus one for
-/// the reader's own records.
-pub const max_feed_filters = 2 * (max_follows_divided + 1) + 1;
+/// How many filters the feed subscription can need: two per chunk, plus one per
+/// kind of the reader's own records.
+pub const max_feed_filters = 2 * (max_follows_divided + 1) + self_filter_kinds.len;
 
 /// The feed's notes.
 /// How many kinds the feed may read in one rebuild.
@@ -23000,11 +23018,6 @@ const profile_filter_kinds = [_]u16{ 0, relay_list_kind };
 /// is the entire reason the bulk filter above can stop asking for it.
 const self_filter_kinds = [_]u16{ 0, relay_list_kind, contact_list_kind, mute_list_kind, bookmark_list_kind, blossom_list_kind };
 
-/// Backing store for the reader's own author filter. A `Filter` borrows its
-/// `authors` slice, so this cannot live on `buildFeedFilters`' stack. Written
-/// only there, and only from the relay threads that build a subscription.
-var g_self_filter_author: [1][32]u8 = undefined;
-
 /// Splits `authors` across filters small enough for a relay to accept, two per
 /// chunk, and returns the slice of `out` that was filled.
 ///
@@ -23013,7 +23026,7 @@ var g_self_filter_author: [1][32]u8 = undefined;
 /// envelope that arrives. The per-chunk limit is NOT divided: each chunk names
 /// different people, and splitting the limit would starve whoever landed in the
 /// last one.
-pub fn buildFeedFilters(authors: []const [32]u8, self: ?[32]u8, since: ?i64, out: []nostr.filter.Filter) []nostr.filter.Filter {
+pub fn buildFeedFilters(authors: []const [32]u8, self: ?*const [1][32]u8, since: ?i64, out: []nostr.filter.Filter) []nostr.filter.Filter {
     var len: usize = 0;
     var start: usize = 0;
     while (start < authors.len) : (start += follow_chunk) {
@@ -23038,17 +23051,24 @@ pub fn buildFeedFilters(authors: []const [32]u8, self: ?[32]u8, since: ?i64, out
         };
         len += 2;
     }
-    // The reader's own three records, asked for once rather than folded into a
-    // five-hundred-author filter. `self_storage` outlives the returned slice
-    // because it is a module-level buffer: a filter borrows its authors, and a
-    // local array here would dangle the moment this function returned.
+    // The reader's own records, asked for on their own rather than folded into a
+    // five-hundred-author filter, and one filter per kind with a limit of one.
+    //
+    // They were one filter with a limit of five. A relay that keeps older
+    // versions of a replaceable record (some do) could fill those five with old
+    // contact lists and finish without ever sending the mute list, and "this
+    // relay finished without one" is what the fresh-list question rests on.
+    //
+    // The author is the caller's: a filter borrows its authors, and the shared
+    // module-level copy this used to write was written by every relay thread
+    // at once, so one thread could send the account another had just put there.
     if (self) |pk| {
-        if (len < out.len) {
-            g_self_filter_author[0] = pk;
+        for (0..self_filter_kinds.len) |k| {
+            if (len >= out.len) break;
             out[len] = .{
-                .authors = g_self_filter_author[0..1],
-                .kinds = &self_filter_kinds,
-                .limit = self_filter_kinds.len,
+                .authors = pk,
+                .kinds = self_filter_kinds[k .. k + 1],
+                .limit = 1,
             };
             len += 1;
         }
@@ -23450,7 +23470,7 @@ fn writeBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWrite {
     const have_base = previous != null;
     const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
 
-    if (!have_base and !noHistoryKnown(.bookmarks)) return .no_list_yet;
+    if (!have_base and !g_identity_minted_here and !takeFresh(.bookmarks)) return .no_list_yet;
 
     if (base_content.len > 0) switch (privateHalfGate(gpa, base_content)) {
         .readable => {},
@@ -23549,7 +23569,7 @@ fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) BookmarkWr
     };
     defer gpa.free(plaintext);
 
-    g_private_seal = .{ .active = true, .event_id = event_id, .adding = adding };
+    g_private_seal = .{ .active = true, .event_id = event_id, .adding = adding, .base = if (previous) |prev| prev.id else null };
 
     if (g_signer_kind == .remote) {
         g_private_seal.awaiting_remote = true;
@@ -23622,7 +23642,14 @@ fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8) vo
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
     const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
     const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
-    if (previous == null and !noHistoryKnown(.bookmarks)) {
+    // The ciphertext was sealed over the record held at the press. If another
+    // has landed since (the real list, arriving late), it carries a private half
+    // this seal never saw, and publishing would erase it.
+    if (!sameRecord(previous, seal.base)) {
+        setToast(model, "Your bookmarks changed while that was being sealed, so nothing was changed. Try again.");
+        return;
+    }
+    if (previous == null and !g_identity_minted_here and !takeFresh(.bookmarks)) {
         setToast(model, noListToast("bookmarks"));
         return;
     }
@@ -23816,7 +23843,7 @@ fn writeMute(fx: *Effects, pubkey: [32]u8, muting: bool) MuteWrite {
     const have_base = previous != null;
     const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
 
-    if (!have_base and !noHistoryKnown(.mutes)) return .no_list_yet;
+    if (!have_base and !g_identity_minted_here and !takeFresh(.mutes)) return .no_list_yet;
 
     // The private half, carried forward VERBATIM and only when it is understood.
     //
@@ -24026,8 +24053,20 @@ const PrivateSeal = struct {
     adding: bool = false,
     /// Set while a bunker is sealing it, so a refusal can be told from silence.
     awaiting_remote: bool = false,
+    /// The id of the list the new private half was built from, or null when
+    /// there was none. The finish publishes only over that same record.
+    base: ?[32]u8 = null,
 };
 var g_private_seal: PrivateSeal = .{};
+
+/// Whether `now` is the record whose id was `then` (both absent counts).
+fn sameRecord(now: ?OwnProfile, then: ?[32]u8) bool {
+    if (now) |rec| {
+        const id = then orelse return false;
+        return std.mem.eql(u8, &rec.id, &id);
+    }
+    return then == null;
+}
 
 fn privateHalfId(content: []const u8) [32]u8 {
     var out: [32]u8 = undefined;
@@ -24921,9 +24960,53 @@ fn contactsConfirmedAbsent() bool {
     return counts.answered >= counts.readable;
 }
 
+/// Whether every relay that could hold this account's own lists has finished
+/// answering without sending one: every relay Plaza reads from, AND every relay
+/// the reader's own kind:10002 says they write to.
+///
+/// The second half is the one that matters. NIP-65 puts a reader's lists on
+/// their WRITE relays, and the pool Plaza reads from can be anything: the
+/// bootstrap relays on a cold import, a list of eight cut from a longer one, a
+/// relay the reader marked write-only so it is never asked. Silence from those
+/// is silence from the wrong place. Jumble asks the same relays for the same
+/// reason (`client.service.ts:1436`, the author's write relays first). An
+/// unknown relay list means it is not known where the lists live, which is
+/// never "finished".
+fn ownRelaysAllFinished() bool {
+    const pk = activePubkey() orelse return false;
+    const counts = relayAnswers(pk);
+    if (counts.readable == 0 or counts.answered < counts.readable) return false;
+    return counts.outbox == .read;
+}
+
+pub fn ownRelaysAllFinishedForTest() bool {
+    return ownRelaysAllFinished();
+}
+
+pub fn noteOwnOutboxForTest(ev: nostr.event.Event) void {
+    noteOwnOutbox(ev);
+}
+
+pub fn noHistoryKnownForTest(kind: ListKind) bool {
+    return noHistoryKnown(kind);
+}
+
 /// How many of the relays this reader reads from have finished answering about
-/// their own records, and how many there are.
-const RelayAnswers = struct { answered: usize, readable: usize };
+/// their own records, how many there are, and whether the reader's own write
+/// relays are among them.
+const RelayAnswers = struct { answered: usize, readable: usize, outbox: OutboxRead = .unknown };
+
+/// Where the reader's own write relays stand against the pool.
+const OutboxRead = enum {
+    /// No kind:10002 for this account has been seen, or it names no relay they
+    /// write to: nobody can say where their lists are kept.
+    unknown,
+    /// At least one relay they write to is not one Plaza reads from (not in the
+    /// pool, write-only here, or past what the pool can hold).
+    not_read,
+    /// Every relay they write to is one Plaza reads from.
+    read,
+};
 
 fn relayAnswers(pk: [32]u8) RelayAnswers {
     lockOwnProfile();
@@ -24934,9 +25017,78 @@ fn relayAnswers(pk: [32]u8) RelayAnswers {
         const e = relayAt(i) orelse continue;
         if (!e.read) continue;
         out.readable += 1;
-        if (mine and g_contacts_answered_by[i]) out.answered += 1;
+        if (mine and answeredFromSeat(i, e.url())) out.answered += 1;
     }
+    out.outbox = outboxRead(pk);
     return out;
+}
+
+/// The relays this reader's own newest kind:10002 says they write to, recorded
+/// as it arrives and keyed by the account it came from. Guarded by the
+/// own-profile lock: an ingest thread writes it, the UI thread reads it.
+const OwnOutbox = struct {
+    of: ?[32]u8 = null,
+    created_at: i64 = 0,
+    urls: [max_relays][96]u8 = undefined,
+    lens: [max_relays]u8 = [_]u8{0} ** max_relays,
+    len: usize = 0,
+    /// A write relay Plaza cannot ask: more of them than the pool has seats, or
+    /// an address it cannot dial. The read can never be called finished.
+    unaskable: bool = false,
+};
+var g_own_outbox: OwnOutbox = .{};
+
+/// Records the write relays of the reader's own kind:10002. Newer replaces older;
+/// a list about another account, or one not newer than what is held, is ignored.
+fn noteOwnOutbox(ev: nostr.event.Event) void {
+    var next: OwnOutbox = .{ .of = ev.pubkey, .created_at = ev.created_at };
+    for (ev.tags) |tag| {
+        if (tag.len < 2 or !std.mem.eql(u8, tag[0], "r")) continue;
+        // Same reading as `applyOwnRelayList`: only `read` narrows a relay away
+        // from writing, and an unknown marker narrows nothing.
+        if (tag.len >= 3 and std.mem.eql(u8, tag[2], "read")) continue;
+        const url = std.mem.trim(u8, tag[1], " \t\r\n");
+        if (!isRelayUrl(url) or url.len > 96) {
+            next.unaskable = true;
+            continue;
+        }
+        var dup = false;
+        for (0..next.len) |j| {
+            if (relayUrlEql(next.urls[j][0..next.lens[j]], url)) dup = true;
+        }
+        if (dup) continue;
+        if (next.len >= max_relays) {
+            next.unaskable = true;
+            continue;
+        }
+        @memcpy(next.urls[next.len][0..url.len], url);
+        next.lens[next.len] = @intCast(url.len);
+        next.len += 1;
+    }
+    lockOwnProfile();
+    defer unlockOwnProfile();
+    if (g_own_outbox.of) |held| {
+        if (std.mem.eql(u8, &held, &ev.pubkey) and ev.created_at <= g_own_outbox.created_at) return;
+    }
+    g_own_outbox = next;
+}
+
+/// Called with the own-profile lock held.
+fn outboxRead(pk: [32]u8) OutboxRead {
+    const of = g_own_outbox.of orelse return .unknown;
+    if (!std.mem.eql(u8, &of, &pk)) return .unknown;
+    if (g_own_outbox.len == 0 and !g_own_outbox.unaskable) return .unknown;
+    if (g_own_outbox.unaskable) return .not_read;
+    for (0..g_own_outbox.len) |j| {
+        const want = g_own_outbox.urls[j][0..g_own_outbox.lens[j]];
+        var found = false;
+        for (0..relaySlots()) |i| {
+            const e = relayAt(i) orelse continue;
+            if (e.read and relayUrlEql(e.url(), want)) found = true;
+        }
+        if (!found) return .not_read;
+    }
+    return .read;
 }
 
 /// How long Plaza keeps saying it is reading the reader's own lists before it
@@ -24964,7 +25116,7 @@ var g_own_lists_since_for: ?[32]u8 = null;
 /// there is no sign-in path that has to remember to start it.
 pub fn ownListsRead() OwnListsRead {
     const pk = activePubkey() orelse return .reading;
-    if (contactsConfirmedAbsent()) return .none_found;
+    if (ownRelaysAllFinished()) return .none_found;
     const now = nowSeconds();
     if (g_own_lists_since_for) |who| {
         if (!std.mem.eql(u8, &who, &pk)) g_own_lists_since_for = null;
@@ -25011,7 +25163,20 @@ fn forgetFresh() void {
 fn startedFresh(kind: ListKind) bool {
     const pk = activePubkey() orelse return false;
     const who = g_fresh_for orelse return false;
-    return std.mem.eql(u8, &who, &pk) and g_fresh[@intFromEnum(kind)];
+    if (!std.mem.eql(u8, &who, &pk) or !g_fresh[@intFromEnum(kind)]) return false;
+    // The yes was about the relays as they stood. A retry, a relay added or the
+    // reader's own relay list arriving since has reopened the question.
+    return ownRelaysAllFinished();
+}
+
+/// Spends the reader's yes on the write that starts the list. One yes starts one
+/// list: once it exists, every later write splices onto it, and a later read
+/// that comes back empty (a store error, a record not yet back from a bunker) is
+/// refused rather than read as "start again from nothing".
+fn takeFresh(kind: ListKind) bool {
+    if (!startedFresh(kind)) return false;
+    g_fresh[@intFromEnum(kind)] = false;
+    return true;
 }
 
 /// Whether having no `kind` list is a fact about this account rather than a read
@@ -25029,7 +25194,7 @@ fn noHistoryKnown(kind: ListKind) bool {
 /// Set here, on the confirmation, and never on the press that asked for it.
 fn confirmStartFresh(kind: ListKind) bool {
     const pk = activePubkey() orelse return false;
-    if (!contactsConfirmedAbsent()) return false;
+    if (!ownRelaysAllFinished()) return false;
     if (g_fresh_for) |who| {
         if (!std.mem.eql(u8, &who, &pk)) g_fresh = @splat(false);
     }
@@ -25045,14 +25210,18 @@ fn confirmStartFresh(kind: ListKind) bool {
 fn needsFreshConsent(kind: ListKind) bool {
     if (activePubkey() == null) return false;
     if (noHistoryKnown(kind)) return false;
-    const held = switch (kind) {
+    if (listHeld(kind)) return false;
+    return ownListsRead() == .none_found;
+}
+
+/// Whether a copy of `kind` is held here, so a write splices onto it.
+fn listHeld(kind: ListKind) bool {
+    return switch (kind) {
         .follows => g_pending_follow_tags != null or haveOwnContactList(),
         .mutes => ownRecordExists(mute_list_kind),
         .bookmarks => ownRecordExists(bookmark_list_kind),
         .profile => ownRecordExists(0),
     };
-    if (held) return false;
-    return ownListsRead() == .none_found;
 }
 
 pub fn needsFreshConsentForTest(kind: ListKind) bool {
@@ -25075,16 +25244,43 @@ pub fn ownListsWaitedForTest(seconds: i64) void {
 }
 
 /// Says how far the read got, in the reader's terms: how many of the relays
-/// they read from have finished. For the line under a control that is waiting.
+/// they read from have finished or, once they all have, which relays Plaza is
+/// still missing. For the line under a control that is waiting.
 fn ownListsProgress(ui: *AppUi) []const u8 {
     const pk = activePubkey() orelse return "";
     const counts = relayAnswers(pk);
     if (counts.readable == 0) return "No relay is set to read from.";
-    return ui.fmt("{d} of {d} {s} finished answering.", .{ counts.answered, counts.readable, if (counts.readable == 1) "relay" else "relays" });
+    if (counts.answered < counts.readable) {
+        return ui.fmt("{d} of {d} {s} finished answering.", .{ counts.answered, counts.readable, if (counts.readable == 1) "relay" else "relays" });
+    }
+    return switch (counts.outbox) {
+        .unknown => "Plaza has not found your relay list, so it cannot tell which relays keep your lists.",
+        .not_read => "Plaza does not read from every relay you write to, which is where your lists are kept.",
+        .read => "",
+    };
+}
+
+/// What the reader can do about a read that did not finish, beyond asking again.
+fn ownListsAdvice() []const u8 {
+    const pk = activePubkey() orelse return "";
+    const counts = relayAnswers(pk);
+    if (counts.answered < counts.readable) return " A relay that is down can be removed in Settings.";
+    return switch (counts.outbox) {
+        .not_read => " Those relays can be added, or set to read, in Settings.",
+        .unknown, .read => "",
+    };
 }
 
 /// Which relays have answered about this account's contact list.
 var g_contacts_answered_by = [_]bool{false} ** max_relays;
+/// And the address each one had when it answered. A slot is a seat, not a
+/// relay: adopting the reader's own relay list, or removing a relay and adding
+/// another, seats a different relay at the same index, and an answer from the
+/// one that sat there before says nothing about the one sitting there now. The
+/// reader's own relays land in exactly the seats the bootstrap relays answered
+/// from, so without this they counted as finished before they were asked.
+var g_contacts_answered_url: [max_relays][96]u8 = undefined;
+var g_contacts_answered_url_len = [_]u8{0} ** max_relays;
 
 /// Whether the signed-in key was MINTED by this app, as opposed to imported.
 ///
@@ -25111,10 +25307,11 @@ pub fn setIdentityMintedForTest(minted: bool) void {
     g_identity_minted_here = minted;
 }
 
-/// Records that relay `index` reached the end of what it holds for this account
-/// without producing a contact list.
-fn noteContactsAnsweredBy(index: usize, pk: [32]u8) void {
+/// Records that relay `index`, dialed at `url`, reached the end of what it holds
+/// for this account without producing a contact list.
+fn noteContactsAnsweredBy(index: usize, url: []const u8, pk: [32]u8) void {
     if (index >= max_relays) return;
+    if (url.len == 0 or url.len > g_contacts_answered_url[index].len) return;
     lockOwnProfile();
     defer unlockOwnProfile();
     if (g_own_contacts_asked_for) |asked| {
@@ -25124,10 +25321,28 @@ fn noteContactsAnsweredBy(index: usize, pk: [32]u8) void {
     }
     g_own_contacts_asked_for = pk;
     g_contacts_answered_by[index] = true;
+    @memcpy(g_contacts_answered_url[index][0..url.len], url);
+    g_contacts_answered_url_len[index] = @intCast(url.len);
 }
 
+/// Whether the answer recorded for seat `i` came from the relay sitting there
+/// now. Called with the own-profile lock held.
+fn answeredFromSeat(i: usize, now_url: []const u8) bool {
+    if (!g_contacts_answered_by[i]) return false;
+    return relayUrlEql(g_contacts_answered_url[i][0..g_contacts_answered_url_len[i]], now_url);
+}
+
+/// The relay now in slot `index` answered. Slots with no relay are ignored, as
+/// the ingest thread for an empty seat never dials anything.
 pub fn noteContactsAnsweredByForTest(index: usize, pk: [32]u8) void {
-    noteContactsAnsweredBy(index, pk);
+    const e = relayAt(index) orelse return;
+    noteContactsAnsweredBy(index, e.url(), pk);
+}
+
+/// A relay answered from seat `index` at `url`, whatever sits there now: what an
+/// answer that arrived just before the seat changed hands leaves behind.
+pub fn noteContactsAnsweredFromForTest(index: usize, url: []const u8, pk: [32]u8) void {
+    noteContactsAnsweredBy(index, url, pk);
 }
 
 pub fn contactsConfirmedAbsentForTest() bool {
@@ -25210,7 +25425,7 @@ fn writeFollow(fx: *Effects, pubkey: [32]u8, following: bool) FollowWrite {
     // the two turned "they have a list, splice onto it" into "they have none,
     // publish the nine names this app chose" over a real list. A key minted here
     // is the only case where having nothing is a fact rather than a read error.
-    if (!have_base and !noHistoryKnown(.follows)) return .no_list_yet;
+    if (!have_base and !g_identity_minted_here and !takeFresh(.follows)) return .no_list_yet;
 
     var tags = std.ArrayList(nostr.event.Tag).empty;
     // Freed on every path that does not hand it to the write seam. Two of those
@@ -27205,10 +27420,12 @@ fn ownListsHint(ui: *AppUi) AppUi.Node {
         .reading => ui.fmt("Still reading your own {s}. {s} off until {s}, because writing before then would replace {s}.", .{
             lists, what, if (both) "they arrive" else "it arrives", if (both) "them" else "it",
         }),
-        .incomplete => ui.fmt("{s} Plaza could not finish reading your {s}. {s} off rather than replace a list it has not seen. A relay that is down can be removed in Settings.", .{
-            ownListsProgress(ui), lists, what,
+        .incomplete => ui.fmt("{s} Plaza could not finish reading your {s}. {s} off rather than replace a list it has not seen.{s}", .{
+            ownListsProgress(ui), lists, what, ownListsAdvice(),
         }),
-        .none_found => ui.fmt("None of your relays sent a {s}. {s} off, because a list kept somewhere Plaza has not looked would be replaced.", .{ lists, what }),
+        // Both controls are live here (the press asks first), so there is
+        // nothing off to explain.
+        .none_found => return ui.spacer(0),
     };
     return ui.column(.{ .gap = 0 }, .{
         vgap(ui, 7),
@@ -34379,7 +34596,18 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // flight is skipped.
                 // The Edit profile sheet waits on a real answer before it lets
                 // anything be published over a profile it has not read.
-                if (model.editing_profile and model.profile_stage == .fetching) {
+                if (model.editing_profile and model.profile_stage == .absent and !model.profile_seeded) {
+                    // Absent was what the relays had said by then, not a promise.
+                    // A profile that arrives after it is shown rather than left
+                    // for a Save to merge blank fields into.
+                    const gpa = std.heap.page_allocator;
+                    if (ownProfileJson(gpa)) |own| {
+                        defer freeOwnProfile(gpa, own);
+                        seedProfileFields(model, own.json, true);
+                        model.profile_stage = .have;
+                        model.profile_confirm_new = false;
+                    }
+                } else if (model.editing_profile and model.profile_stage == .fetching) {
                     const gpa = std.heap.page_allocator;
                     if (ownProfileJson(gpa)) |own| {
                         defer freeOwnProfile(gpa, own);
@@ -34903,8 +35131,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const ask = model.fresh_ask orelse return;
             model.fresh_ask = null;
             // Said before anything is written: the question was put while every
-            // relay had finished, and the yes is only taken if that still holds.
-            if (!confirmStartFresh(ask.kind())) {
+            // relay had finished, and the yes is only taken if that still holds,
+            // and only for the account it was asked about.
+            const still_me = if (activePubkey()) |me| std.mem.eql(u8, &me, &ask.of) else false;
+            // The list turned up while the question was open: the write below
+            // splices onto it like any other, and no yes is recorded, so nothing
+            // is left armed to start one from nothing later.
+            const arrived = still_me and listHeld(ask.kind());
+            if (!still_me or (!arrived and !confirmStartFresh(ask.kind()))) {
                 setToast(model, "Your relays changed while you were deciding, so nothing was changed.");
                 return;
             }
@@ -35600,8 +35834,11 @@ pub fn lastClipboardForTest() []const u8 {
 /// Holds a write that would start a list from nothing and puts the question to
 /// the reader. Returns whether it did, so the caller stops there.
 fn askFreshFirst(model: *Model, ask: FreshAsk) bool {
+    const me = activePubkey() orelse return false;
     if (!needsFreshConsent(ask.kind())) return false;
-    model.fresh_ask = ask;
+    var held = ask;
+    held.of = me;
+    model.fresh_ask = held;
     return true;
 }
 
@@ -35672,6 +35909,8 @@ fn enterSettings(model: *Model) void {
 /// What is waiting on the reader's answer to "start a new list?".
 pub const FreshAsk = struct {
     action: Action,
+    /// The account the question was put about. A yes is never spent on another.
+    of: [32]u8 = [_]u8{0} ** 32,
     /// The person to follow or mute.
     who: [32]u8 = [_]u8{0} ** 32,
     /// The note to bookmark.
@@ -35759,6 +35998,7 @@ fn forgetOwnRecordAnswers() void {
     // inherit the previous one's answers and reach the write gate without any
     // relay having said a word about them.
     g_contacts_answered_by = [_]bool{false} ** max_relays;
+    g_own_outbox = .{};
     g_own_lists_since_for = null;
     forgetFresh();
 }
@@ -36019,6 +36259,19 @@ fn saveProfile(model: *Model, fx: *Effects) void {
     // A profile not found on any relay, for a key that was not made here: the
     // first press shows what a wrong guess costs, and the second is the reader's
     // answer. Nothing is signed or written by the first.
+    if (model.profile_stage == .absent) {
+        // The profile landed after the sheet said there was none. Its fields were
+        // never shown, so merging the sheet into it would remove every one the
+        // reader did not happen to type. Show it first; the next Save merges.
+        const gpa = std.heap.page_allocator;
+        if (ownProfileJson(gpa)) |own| {
+            defer freeOwnProfile(gpa, own);
+            seedProfileFields(model, own.json, true);
+            model.profile_stage = .have;
+            model.profile_confirm_new = false;
+            return;
+        }
+    }
     if (model.profile_stage == .absent and !noHistoryKnown(.profile)) {
         if (!model.profile_confirm_new) {
             model.profile_confirm_new = true;
@@ -45993,7 +46246,9 @@ const OwedSubs = struct {
     engagement: bool = false,
 
     fn mark(self: *OwedSubs, sub_id: []const u8) void {
-        if (std.mem.eql(u8, sub_id, "plaza-feed")) {
+        // The feed under any generation of its id: it is re-issued as
+        // `plaza-feed-<n>` whenever its question changes, sign-in included.
+        if (isFeedSub(sub_id)) {
             self.feed = true;
         } else if (std.mem.eql(u8, sub_id, "plaza-inbox")) {
             self.inbox = true;
@@ -46437,10 +46692,12 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // Set to the generation already served by `subscribeInbox` at dial below,
     // so the loop does not immediately re-issue what was just sent.
     var inbox_gen = identityGeneration();
-    // Whether this subscription asked about the reader themselves. A connection
-    // dialed while signed out did not, and its EOSE is not an answer about them.
-    var asked_about_me = activePubkey() != null;
-    if (activePubkey()) |pk| {
+    // WHO this subscription asked about, if anyone. A connection dialed while
+    // signed out did not ask about the reader, and its EOSE is not an answer
+    // about them. Read once, so the filter and the record of what it asked
+    // cannot name two different accounts across a sign-in.
+    var asked_about: ?[32]u8 = activePubkey();
+    if (asked_about) |pk| {
         authors[authors_len] = pk;
         authors_len += 1;
     }
@@ -46460,7 +46717,10 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // actually accept. The per-chunk limit stays whole for the same reason:
     // dividing it would starve whoever landed in the last chunk.
     var filter_buf: [max_feed_filters]nostr.filter.Filter = undefined;
-    const filters = buildFeedFilters(authors[0..authors_len], activePubkey(), feedSince(), &filter_buf);
+    // The reader's key for their own filters, owned by this connection.
+    var self_author: [1][32]u8 = undefined;
+    if (asked_about) |pk| self_author[0] = pk;
+    const filters = buildFeedFilters(authors[0..authors_len], if (asked_about != null) &self_author else null, feedSince(), &filter_buf);
     // What other people aimed at this reader. Its own subscription, never folded
     // into the feed's: a relay that is handed two differently-scoped filters in
     // one REQ may answer the stored query and then go quiet, which is the worst
@@ -46470,7 +46730,15 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     // A relay marked write-only is not asked anything. It keeps its socket, so a
     // note goes out the moment it is written, but no filter of this reader's
     // ever reaches it: that is the whole difference the badge promises.
-    if (reads) try relay.subscribe("plaza-feed", filters);
+    // The feed's id carries the generation it was asked under. A REQ re-issued
+    // under the SAME id cannot be told apart from the one it replaced, and the
+    // one it replaced may still be answering: the subscription sent as a guest
+    // at launch is usually still in flight when the account signs in, and its
+    // end-of-stored-events would then be read as this relay having finished with
+    // the reader's own lists before it had sent them. See `isFeedSub`.
+    var feed_sub_buf: [32]u8 = undefined;
+    var feed_sub: []const u8 = feed_sub_base;
+    if (reads) try relay.subscribe(feed_sub, filters);
 
     // Latency is measured with a PROBE, never with the subscriptions above: the
     // feed REQ asks for a 300-note backlog plus profiles, so timing it measures
@@ -46523,12 +46791,13 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
             subscribed_gen = followGeneration();
             authors_len = poolAuthorsOrAll(index, &authors);
             var next_authors_len = authors_len;
-            asked_about_me = false;
-            if (activePubkey()) |pk| {
+            const next_self = activePubkey();
+            asked_about = null;
+            if (next_self) |pk| {
                 if (next_authors_len < authors.len) {
                     authors[next_authors_len] = pk;
                     next_authors_len += 1;
-                    asked_about_me = true;
+                    asked_about = pk;
                 }
             }
             // Built by the SAME function the dial-time subscription uses.
@@ -46544,8 +46813,13 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
             // every reader takes: Plaza dials before anyone has signed in, so
             // the subscription that carries the actual account is always the
             // re-issued one, never the one built at dial.
-            const next_filters = buildFeedFilters(authors[0..next_authors_len], activePubkey(), feedSince(), &filter_buf);
-            relay.subscribe("plaza-feed", next_filters) catch {};
+            if (next_self) |pk| self_author[0] = pk;
+            const next_filters = buildFeedFilters(authors[0..next_authors_len], if (next_self != null) &self_author else null, feedSince(), &filter_buf);
+            // Closed and asked again under a new id, rather than replaced in
+            // place, so the old question's answers stay its own.
+            relay.unsubscribe(feed_sub) catch {};
+            feed_sub = std.fmt.bufPrint(&feed_sub_buf, feed_sub_base ++ "-{d}", .{subscribed_gen}) catch feed_sub_base;
+            relay.subscribe(feed_sub, next_filters) catch {};
             // The inbox rides the SAME signal, and for a reason the feed's own
             // comment above already explains: this counter moves on sign-in.
             // Asking only at dial was the whole feature's undoing, because Plaza
@@ -46664,7 +46938,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     if (inboxAdd(e.event, nowSeconds())) markInboxDirty();
                     continue;
                 }
-                if (std.mem.eql(u8, e.subscription_id, "plaza-feed")) {
+                if (isFeedSub(e.subscription_id)) {
                     // Verify (secp256k1) before storing; silently drop a bad event.
                     // `.invalid` is a RETURNED VALUE here, not an error: a
                     // forged event does not throw, it comes back saying it did
@@ -46721,24 +46995,29 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                 // before EOSE: relays dislike a CLOSE for a subscription they
                 // are still answering, which NDK's source says in as many words.
                 if (isOneShotSub(eo.subscription_id)) relay.unsubscribe(eo.subscription_id) catch {};
-                if (std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
+                if (isFeedSub(eo.subscription_id)) {
                     // Only when THIS subscription actually asked about the
                     // reader. A guest-era filter names nine strangers, and its
                     // EOSE says nothing at all about the account that signed in
-                    // afterwards.
-                    if (asked_about_me) {
+                    // afterwards. Nor is the EOSE of a generation this one
+                    // replaced, and nor is an answer about an account that is
+                    // no longer the one signed in: the identity can change
+                    // between the check at the top of this loop and here.
+                    if (asked_about) |asked| {
                         if (activePubkey()) |me| {
                             // Who they follow, recorded against THIS relay.
                             // EOSE means "that is all I have", never "you have
                             // none": one relay that does not carry this list
                             // must not be able to authorize replacing it.
-                            noteContactsAnsweredBy(index, me);
+                            if (std.mem.eql(u8, &asked, &me) and std.mem.eql(u8, eo.subscription_id, feed_sub)) {
+                                noteContactsAnsweredBy(index, url, me);
+                            }
                         }
                     }
                 }
                 // Stored feed drained: now watch those notes' engagement, plus
                 // whatever the view is drawing out of the store.
-                if (engagement_watching == 0 and std.mem.eql(u8, eo.subscription_id, "plaza-feed")) {
+                if (engagement_watching == 0 and isFeedSub(eo.subscription_id)) {
                     feed_ids_len = mergeFeedWatch(&feed_ids, &feed_id_hex, feed_ids_len);
                     engagement_gen = feedWatchGeneration();
                     if (feed_ids_len > 0) {
@@ -46760,7 +47039,7 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
                     // so the next message asks again rather than waiting forever
                     // for an EOSE that is not coming.
                     probe_at = 0;
-                } else if (std.mem.eql(u8, c.subscription_id, "plaza-feed")) {
+                } else if (std.mem.eql(u8, c.subscription_id, feed_sub)) {
                     // The feed is what this connection is FOR, so end it and let
                     // the reconnect ladder decide when to ask again. A relay that
                     // refuses this filter now will usually refuse it in three
