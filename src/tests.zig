@@ -51,6 +51,7 @@ const tests_updates = @import("tests/updates.zig");
 const tests_uploads = @import("tests/uploads.zig");
 const tests_view_article = @import("tests/view_article.zig");
 const tests_view_chrome = @import("tests/view_chrome.zig");
+const tests_view_compose = @import("tests/view_compose.zig");
 
 const canvas = native_sdk.canvas;
 const testing = std.testing;
@@ -1030,20 +1031,6 @@ test "a note that gave up is not called posting" {
     try testing.expectEqualStrings("posting 2 notes…", model.outbox_label(arena));
 }
 
-test "the picker knows when a mention is being typed" {
-    // The last `@word` is the one being written; an `@name` earlier in the note
-    // is already said, and an `@` inside a word is an address, not a mention.
-    try testing.expectEqualStrings("wir", main.mentionQuery("hello @wir").?);
-    try testing.expectEqualStrings("", main.mentionQuery("hello @").?);
-    // Finished: a space means the reader has moved on.
-    try testing.expect(main.mentionQuery("hello @wirth and then") == null);
-    // Mid-word, so not a mention being composed.
-    try testing.expect(main.mentionQuery("mail me at me@example.com") == null);
-    try testing.expect(main.mentionQuery("nothing here") == null);
-    // The LAST run wins, not the first.
-    try testing.expectEqualStrings("ed", main.mentionQuery("@wirth said @ed").?);
-}
-
 test "an empty composer cannot be posted, by button or by key" {
     // The button is disabled when the draft is empty, so before Cmd+Enter the
     // message could never arrive with nothing to send. A key can, and closing
@@ -1065,27 +1052,6 @@ test "an empty composer cannot be posted, by button or by key" {
     try testing.expect(model.draft_empty());
     main.update(&model, .post, &fx);
     try testing.expect(model.composing);
-}
-
-test "an insert that will not fit is refused, not truncated" {
-    // The draft buffer truncates in silence, and half a bech32 reference is one
-    // no client can resolve, published without a word of warning.
-    var model = main.initialModel();
-    var long: [500]u8 = undefined;
-    @memset(&long, 'x');
-    long[499] = '@';
-    model.draft_buffer = @TypeOf(model.draft_buffer).init(&long);
-    const before = model.draft();
-
-    main.insertMentionForTest(&model, [_]u8{0x7a} ** 32);
-    // Unchanged: it did not fit, so it did not happen.
-    try testing.expectEqualStrings(before, model.draft());
-
-    // With room, it lands whole and ends in a resolvable reference.
-    model.draft_buffer = @TypeOf(model.draft_buffer).init("thanks @gi");
-    main.insertMentionForTest(&model, [_]u8{0x7a} ** 32);
-    try testing.expect(std.mem.indexOf(u8, model.draft(), "nostr:npub1") != null);
-    try testing.expect(model.draft().len > 60);
 }
 
 test "a dormant seat in the middle does not leave the popover a hole" {
@@ -4824,6 +4790,7 @@ test {
     _ = tests_uploads;
     _ = tests_view_article;
     _ = tests_view_chrome;
+    _ = tests_view_compose;
 }
 
 // re-exports: tests/feed_media.zig
