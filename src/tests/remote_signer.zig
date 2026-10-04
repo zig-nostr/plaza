@@ -542,3 +542,58 @@ test "a connect answered by the signer is never read as one that never went out"
     thread.join();
     try testing.expectEqual(@as(u32, 0), misread);
 }
+
+test "a bunker with every request slot taken refuses a like before the heart fills" {
+    // A sign with no slot to wait in released its undo unapplied, so the heart
+    // stayed filled with nothing sent.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    main.resetLikesForTest();
+    defer main.resetLikesForTest();
+    main.setIdentityForTest([_]u8{0x91} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = harness.bareRoot(0x92);
+    model.notes_len = 1;
+    const id = model.notes[0].id;
+    var fx: main.EffectsForTest = undefined;
+
+    var ids: [main.max_pending_remote][8]u8 = undefined;
+    for (&ids, 0..) |*buf, i| {
+        try testing.expect(main.registerPendingForTest(try std.fmt.bufPrint(buf, "full{d}", .{i}), .nip44_decrypt, null));
+    }
+    try testing.expect(!main.signerReadyForTest());
+    main.update(&model, Msg{ .like = id }, &fx);
+    try testing.expect(!main.isLikedForTest(id));
+    try testing.expectEqualStrings("Your signer is busy. Try that again in a moment.", model.toast_text());
+
+    main.clearPendingForTest();
+    try testing.expect(main.signerReadyForTest());
+}
+
+test "a bunker sign that cannot go out puts the like back" {
+    // The request could not be built, and its undo was released unapplied.
+    main.clearPendingForTest();
+    defer main.clearPendingForTest();
+    main.resetLikesForTest();
+    defer main.resetLikesForTest();
+    main.setIdentityForTest([_]u8{0x93} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindForTest("remote");
+    defer main.setSignerKindForTest("helper");
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    const note: i64 = 0x1cee;
+    main.rememberLikeForTest(note, [_]u8{0x42} ** 32);
+
+    // No memory to compute the id with, so nothing goes out.
+    const content = try std.heap.page_allocator.dupe(u8, "+");
+    main.requestRemoteSign(testing.failing_allocator, 1_800_000_000, 7, &.{}, content, false, .none, .{ .like = note });
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expect(!main.isLikedForTest(note));
+    try testing.expectEqualStrings("That like was not signed.", model.toast_text());
+}

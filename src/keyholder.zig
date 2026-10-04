@@ -35,6 +35,7 @@ const ingestAndPublish = main.ingestAndPublish;
 const invalidateFeed = main.invalidateFeed;
 const nowSeconds = main.nowSeconds;
 const parseMetadataInto = main.parseMetadataInto;
+const pendingHasRoom = main.pendingHasRoom;
 const pendingLock = main.pendingLock;
 const pendingUnlock = main.pendingUnlock;
 const persistSession = main.persistSession;
@@ -888,7 +889,9 @@ pub fn signerReady() bool {
         // One key, one sign. The bunker's table has eight slots keyed by request
         // id, so it does not collide, and a local key signs inline.
         .helper => !g_helper_sign.active,
-        .remote => true,
+        // Until all eight are taken. A sign with no slot to wait in has nowhere
+        // to keep its undo, so the press is refused before it moves anything.
+        .remote => pendingHasRoom(),
     };
 }
 /// Whether a note is with a signer right now, waiting for a signature. True for

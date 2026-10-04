@@ -1108,7 +1108,7 @@ pub fn toggleLike(model: *Model, fx: *Effects, note_id: i64) void {
     // A like and an un-like both move `g_my_likes` before they sign, and an
     // un-like's kind:5 is a deletion. A rejected sign there would leave the heart
     // empty and the reaction still standing on every relay.
-    if (!signerReady()) return;
+    if (!signerReady()) return setToast(model, "Your signer is busy. Try that again in a moment.");
     if (isLiked(note_id)) unlike(fx, note_id) else like(model, fx, note_id);
 }
 
@@ -1141,7 +1141,7 @@ pub fn repost(model: *Model, fx: *Effects, note_id: i64) void {
         model.joining = true;
         return;
     }
-    if (!signerReady()) return;
+    if (!signerReady()) return setToast(model, "Your signer is busy. Try that again in a moment.");
     if (engagementFor(note_id).reposted_by_me) return;
     const note = model.noteById(note_id) orelse return;
     const gpa = std.heap.page_allocator;

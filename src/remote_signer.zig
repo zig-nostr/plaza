@@ -247,6 +247,16 @@ pub fn pendingUnlock() void {
     g_pending_lock.store(false, .release);
 }
 
+/// Whether the table has a slot free for one more request.
+pub fn pendingHasRoom() bool {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (!slot.active) return true;
+    }
+    return false;
+}
+
 /// Records a request as awaiting its response, taking ownership of `content`
 /// (the draft, for `sign_event`, so a timeout can restore it when `restorable`).
 /// Returns false when the table is full or the id does not fit, in which case
@@ -289,6 +299,7 @@ fn registerPendingWith(req_id: []const u8, method: RemoteMethod, content: ?[]con
 /// duplicated response from publishing twice). The caller owns the returned
 /// slot's `content`.
 pub fn takePending(req_id: []const u8) ?PendingRemote {
+    if (req_id.len == 0) return null;
     pendingLock();
     defer pendingUnlock();
     for (&g_pending) |*slot| {
@@ -307,6 +318,9 @@ pub fn takePending(req_id: []const u8) ?PendingRemote {
 /// "connecting", and with the two done apart an answer that arrived between them
 /// read as exactly that, and a signer that said yes was reported as silent.
 pub fn takeAnswered(req_id: []const u8) ?PendingRemote {
+    // A sign parked before it went out has no id, and an answer naming none is
+    // not about it.
+    if (req_id.len == 0) return null;
     pendingLock();
     defer pendingUnlock();
     for (&g_pending) |*slot| {
@@ -404,6 +418,7 @@ fn parkFailedSign(taken: PendingRemote, wrong_key: bool) void {
 /// for the UI tick to restore the draft and free the content. Returns whether a
 /// slot matched.
 pub fn failPending(req_id: []const u8) bool {
+    if (req_id.len == 0) return false;
     pendingLock();
     defer pendingUnlock();
     for (&g_pending) |*slot| {
@@ -663,15 +678,15 @@ pub fn requestRemoteSign(gpa: std.mem.Allocator, created_at: i64, kind: u16, tag
 /// and answered to a different place.
 pub fn requestRemoteSignAs(method: RemoteMethod, gpa: std.mem.Allocator, created_at: i64, kind: u16, tags: []const nostr.event.Tag, content_owned: []const u8, restorable: bool, route: PlaceRoute, undo: PendingUndo) void {
     // `content_owned` and `undo` are handed to the pending slot (so a timeout
-    // can restore them); they are freed here only on an early return.
-    var handed = false;
-    defer if (!handed) releaseUndo(undo);
+    // can restore them). A request that cannot go out is parked failed with
+    // both, so the tick gives the draft back and puts back what the press
+    // changed, the same as for a refusal. Released here instead, a like stayed
+    // filled with nothing sent and a reply was gone.
+    const unsent = UnsentSign{ .method = method, .content = content_owned, .restorable = restorable, .route = route, .warn = WarnCarry.fromTags(tags), .undo = undo, .kind = kind };
     // A canonical unsigned event (the bunker fills in the signature). The id is
     // computed against the user's pubkey so the bunker's result matches it.
-    const id = nostr.event.computeId(gpa, g_remote_pubkey, created_at, kind, tags, content_owned) catch {
-        gpa.free(content_owned);
-        return;
-    };
+    const id = nostr.event.computeId(gpa, g_remote_pubkey, created_at, kind, tags, content_owned) catch
+        return unsent.park();
     const unsigned = nostr.event.Event{
         .id = id,
         .pubkey = g_remote_pubkey,
@@ -681,27 +696,44 @@ pub fn requestRemoteSignAs(method: RemoteMethod, gpa: std.mem.Allocator, created
         .content = content_owned,
         .sig = [_]u8{0} ** 64,
     };
-    const unsigned_json = nostr.event.toJson(gpa, unsigned) catch {
-        gpa.free(content_owned);
-        return;
-    };
+    const unsigned_json = nostr.event.toJson(gpa, unsigned) catch return unsent.park();
     defer gpa.free(unsigned_json);
 
     var idbuf: [24]u8 = undefined;
-    const req_id = newRequestId(&idbuf) orelse {
-        gpa.free(content_owned);
-        return;
-    };
+    const req_id = newRequestId(&idbuf) orelse return unsent.park();
     // Track before sending: the response can arrive on the listener thread the
     // instant the send lands, and it must find the pending slot already there.
-    if (!registerPendingWith(req_id, method, content_owned, restorable, route, 0, no_half_id, WarnCarry.fromTags(tags), undo, kind)) {
-        gpa.free(content_owned);
-        return;
-    }
-    handed = true;
+    // A full table is refused before the press (see `signerReady`).
+    if (!registerPendingWith(req_id, method, content_owned, restorable, route, 0, no_half_id, unsent.warn, undo, kind)) return unsent.park();
     const params = [_][]const u8{unsigned_json};
     sendRequest(gpa, .{ .id = req_id, .method = "sign_event", .params = &params });
 }
+
+/// A sign that never went out, with everything its request would have held.
+const UnsentSign = struct {
+    method: RemoteMethod,
+    content: []const u8,
+    restorable: bool,
+    route: PlaceRoute,
+    warn: WarnCarry,
+    undo: PendingUndo,
+    kind: u16,
+
+    /// Into the table, failed, for the tick to retire. It has no request id,
+    /// so no answer can ever match it.
+    fn park(self: UnsentSign) void {
+        parkFailedSign(.{
+            .method = self.method,
+            .generation = g_remote_generation.load(.acquire),
+            .content = self.content,
+            .restorable = self.restorable,
+            .route = self.route,
+            .warn = if (self.restorable) self.warn else .{},
+            .undo = self.undo,
+            .kind = self.kind,
+        }, false);
+    }
+};
 
 /// Which NIP-46 method opens this private half.
 ///

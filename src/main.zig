@@ -6514,6 +6514,7 @@ pub const newRemoteGeneration = remote_signer.newRemoteGeneration;
 pub const newRequestId = remote_signer.newRequestId;
 pub const nip46ReceiveLoop = remote_signer.nip46ReceiveLoop;
 pub const no_half_id = remote_signer.no_half_id;
+pub const pendingHasRoom = remote_signer.pendingHasRoom;
 pub const pendingLock = remote_signer.pendingLock;
 pub const pendingUnlock = remote_signer.pendingUnlock;
 pub const registerPending = remote_signer.registerPending;
