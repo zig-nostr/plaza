@@ -398,46 +398,86 @@ test "a note Notary signs goes to the place it was written in" {
     try testing.expect(main.lastPublishedRouteExclusiveForTest());
 }
 
-test "a refused note goes back under what was typed since, or to the clipboard" {
-    // A refused note went back only into an empty composer. A reader who had
-    // started the next note lost the refused one, with nothing said.
+test "a refused note never changes what is in the composer" {
+    // A refused note went under what was typed since, or to the clipboard on
+    // the next tick. The first changed the box under a reader who was typing;
+    // the second wrote the clipboard without being asked.
     main.setIdentityForTest([_]u8{0x53} ** 32);
     defer main.clearIdentityForTest();
     main.setSignerKindHelperForTest();
     defer main.setSignerKindLocalForTest();
     defer main.releaseHelperSignForTest();
+    defer main.forgetRefused();
+    main.clearLastClipboardForTest();
     var fx: main.EffectsForTest = undefined;
 
-    // Both fit: what was typed since stays first.
-    {
-        var model = main.initialModel();
-        main.requestHelperSignForTest(&fx, 1_800_000_000, 1, "the refused note", true);
-        model.draft_buffer.set("typed since");
-        main.expireHelperSignForTest();
-        main.scanHelperSignForTest(&model);
-        try testing.expectEqualStrings("typed since\n\nthe refused note", model.draft());
-        try testing.expectEqualStrings("Not signed. It is back, under what you typed.", model.toast_text());
-    }
+    var model = main.initialModel();
+    main.requestHelperSignForTest(&fx, 1_800_000_000, 1, "the refused note", true);
+    model.draft_buffer.set("typed since");
+    main.expireHelperSignForTest();
+    main.scanHelperSignForTest(&model);
+    try testing.expectEqualStrings("typed since", model.draft());
+    try testing.expectEqualStrings("the refused note", main.refusedTextForTest(0).?);
+    try testing.expectEqual(@as(usize, 1), main.refusedCount(&model, .note));
+    try testing.expectEqualStrings("Not signed. It is kept in the composer.", model.toast_text());
+    try testing.expectEqualStrings("", main.lastClipboardForTest());
 
-    // They do not fit: the box is untouched, and the note is on the clipboard
-    // on the next tick, said only then.
-    {
-        var model = main.initialModel();
-        main.requestHelperSignForTest(&fx, 1_800_000_001, 1, "too long to join", true);
-        var long: [4090]u8 = undefined;
-        @memset(&long, 'y');
-        model.draft_buffer.set(&long);
-        main.expireHelperSignForTest();
-        main.scanHelperSignForTest(&model);
-        try testing.expectEqualSlices(u8, &long, model.draft());
-        try testing.expect(std.mem.indexOf(u8, model.toast_text(), "back") == null);
-        main.copyRefusedDraftForTest(&model, &fx);
-        try testing.expectEqualStrings("too long to join", main.lastClipboardForTest());
-        try testing.expectEqualStrings("Not signed. No room, so it is on the clipboard.", model.toast_text());
-    }
+    // Into an empty composer it goes back as it was.
+    var empty = main.initialModel();
+    main.requestHelperSignForTest(&fx, 1_800_000_001, 1, "back in the box", true);
+    main.expireHelperSignForTest();
+    main.scanHelperSignForTest(&empty);
+    try testing.expectEqualStrings("back in the box", empty.draft());
+    try testing.expectEqualStrings("Not signed. Your draft is back.", empty.toast_text());
+    try testing.expectEqual(@as(usize, 1), main.refusedCount(&empty, .note));
 }
 
-test "every note a bunker refuses in one sweep comes back, not only the first" {
+test "a note held in its pause goes alone, and a refused one is kept aside" {
+    main.setIdentityForTest([_]u8{0x55} ** 32);
+    defer main.clearIdentityForTest();
+    main.setSignerKindHelperForTest();
+    defer main.setSignerKindLocalForTest();
+    defer main.releaseHelperSignForTest();
+    defer main.forgetRefused();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+
+    // A note is out with Notary. The reader writes the next and presses Post
+    // with the pause on, and while it counts the first is refused.
+    main.requestHelperSignForTest(&fx, 1_800_000_000, 1, "the earlier note", true);
+    model.draft_buffer.set("the held note");
+    main.holdPostForTest(1_800_000_000);
+    main.expireHelperSignForTest();
+    main.scanHelperSignForTest(&model);
+    try testing.expectEqualStrings("the held note", model.draft());
+    try testing.expectEqualStrings("the earlier note", main.refusedTextForTest(0).?);
+
+    // The pause runs out. What goes is what was held, and nothing else.
+    main.setSignerKindLocalForTest();
+    try testing.expect(main.firePost(&model, &fx, null));
+    const out = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expectEqualStrings("the held note", out.content);
+    try testing.expectEqual(@as(usize, 1), main.refusedCount(&model, .note));
+
+    // A composer emptied while its note is held is still holding: a refused
+    // note put into it would be posted when the pause ran out.
+    main.setSignerKindHelperForTest();
+    main.requestHelperSignForTest(&fx, 1_800_000_001, 1, "refused again", true);
+    model.composing = true;
+    model.draft_buffer.set("held again");
+    main.holdPostForTest(1_800_000_000);
+    model.draft_buffer.clear();
+    main.expireHelperSignForTest();
+    main.scanHelperSignForTest(&model);
+    try testing.expect(model.draft_empty());
+    try testing.expectEqualStrings("refused again", main.refusedTextForTest(1).?);
+}
+
+test "every note a bunker refuses in one sweep is kept, not only the first" {
     // The sweep kept the first refused draft and freed the rest.
     main.clearPendingForTest();
     defer main.clearPendingForTest();
@@ -445,6 +485,8 @@ test "every note a bunker refuses in one sweep comes back, not only the first" {
     defer main.clearIdentityForTest();
     main.setSignerKindForTest("remote");
     defer main.setSignerKindForTest("helper");
+    defer main.forgetRefused();
+    main.clearLastClipboardForTest();
     var fx: main.EffectsForTest = undefined;
     var model = main.initialModel();
     model.stage = .ready;
@@ -454,11 +496,18 @@ test "every note a bunker refuses in one sweep comes back, not only the first" {
     try testing.expect(main.submitPostForTest(&model, &fx));
     model.draft_buffer.set("second note");
     try testing.expect(main.submitPostForTest(&model, &fx));
+    model.draft_buffer.set("third, being typed");
     try testing.expect(main.failPendingByContentForTest("first note"));
     try testing.expect(main.failPendingByContentForTest("second note"));
     main.scanPendingRemoteForTest(&model, &fx);
-    try testing.expect(std.mem.indexOf(u8, model.draft(), "first note") != null);
-    try testing.expect(std.mem.indexOf(u8, model.draft(), "second note") != null);
+    try testing.expectEqualStrings("third, being typed", model.draft());
+    try testing.expectEqual(@as(usize, 2), main.refusedCount(&model, .note));
+    try testing.expectEqualStrings("", main.lastClipboardForTest());
+
+    // Copy takes both, oldest first.
+    main.update(&model, .{ .refused_copy = .note }, &fx);
+    try testing.expectEqualStrings("first note\n\nsecond note", main.lastClipboardForTest());
+    try testing.expectEqual(@as(usize, 0), main.refusedCount(&model, .note));
 }
 
 // ---- B3: guest-first launch ------------------------------------------------

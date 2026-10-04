@@ -13,9 +13,7 @@ const geometry = native_sdk.geometry;
 
 // ---- from main.zig
 const WarnCarry = main.WarnCarry;
-const max_pending_remote = main.max_pending_remote;
-const refused_draft_clip_key = main.refused_draft_clip_key;
-const copy_refused_reply_key = main.copy_refused_reply_key;
+const refused_text_clip_key = main.refused_text_clip_key;
 const writeClipboardText = main.writeClipboardText;
 const Effects = main.Effects;
 const note_content_cap = main.note_content_cap;
@@ -101,66 +99,6 @@ pub fn keepReplyDraft(event_id: [32]u8, text: []const u8, replace: bool) void {
     @memcpy(g_reply_drafts[i].text[0..n], text[0..n]);
 }
 
-/// Where a refused reply went, so the toast says what is true.
-const RefusedReply = enum { box, box_below, kept, kept_below, copied };
-
-/// Puts a reply the signer refused back where the reader can find it.
-///
-/// Into the reply box it was taken from when its thread is still open. The box
-/// belongs to whatever thread is open NOW, so when the reader has moved on the
-/// reply is kept for its own thread instead: put in the open box it would read
-/// as an answer to somebody else, one press from being sent there.
-///
-/// Whatever was typed since stays first and untouched, and the refused text goes
-/// under it after a blank line. When the two do not fit in one reply it is
-/// copied instead, so it is never dropped and never claimed to be back.
-pub fn putBackRefusedReply(model: *Model, root: [32]u8, text: []const u8) RefusedReply {
-    const sep = "\n\n";
-    var joined: [compose_capacity]u8 = undefined;
-    if (model.viewing_thread != 0 and std.mem.eql(u8, &model.thread_root.event_id, &root)) {
-        if (model.reply_empty()) {
-            model.reply_buffer.set(text);
-            return .box;
-        }
-        const typed = model.reply_buffer.text();
-        if (typed.len + sep.len + text.len > compose_capacity) return copyRefusedReply(text);
-        model.reply_buffer.set(std.fmt.bufPrint(&joined, "{s}" ++ sep ++ "{s}", .{ typed, text }) catch unreachable);
-        return .box_below;
-    }
-    const kept = keptReplyDraft(root) orelse {
-        keepReplyDraft(root, text, false);
-        return .kept;
-    };
-    if (kept.len + sep.len + text.len > compose_capacity) return copyRefusedReply(text);
-    const both = std.fmt.bufPrint(&joined, "{s}" ++ sep ++ "{s}", .{ kept, text }) catch unreachable;
-    keepReplyDraft(root, both, true);
-    return .kept_below;
-}
-
-/// Holds a refused reply for the clipboard, which the next tick writes: the
-/// signer's answer is read where no `Effects` is at hand.
-fn copyRefusedReply(text: []const u8) RefusedReply {
-    const n = @min(text.len, compose_capacity);
-    @memcpy(g_refused_reply_clip[0..n], text[0..n]);
-    g_refused_reply_clip_len = n;
-    return .copied;
-}
-
-var g_refused_reply_clip: [compose_capacity]u8 = undefined;
-
-var g_refused_reply_clip_len: usize = 0;
-
-pub fn flushRefusedReplyClip(fx: *Effects) void {
-    if (g_refused_reply_clip_len == 0) return;
-    writeClipboardText(fx, copy_refused_reply_key, g_refused_reply_clip[0..g_refused_reply_clip_len]);
-    @memset(g_refused_reply_clip[0..g_refused_reply_clip_len], 0);
-    g_refused_reply_clip_len = 0;
-}
-
-pub fn refusedReplyClipForTest() []const u8 {
-    return g_refused_reply_clip[0..g_refused_reply_clip_len];
-}
-
 /// The reply kept for the thread rooted at `event_id`, if there is one.
 fn keptReplyDraft(event_id: [32]u8) ?[]const u8 {
     for (&g_reply_drafts) |*d| {
@@ -183,8 +121,7 @@ pub fn takeReplyDraft(model: *Model, event_id: [32]u8) void {
 /// Forgets every kept reply, for a session that is ending. The text is wiped as
 /// well as released: it is the leaving account's private thinking.
 pub fn forgetReplyDrafts() void {
-    @memset(&g_refused_reply_clip, 0);
-    g_refused_reply_clip_len = 0;
+    forgetRefused();
     for (&g_reply_drafts) |*d| {
         @memset(&d.text, 0);
         d.used = false;
@@ -303,68 +240,206 @@ pub fn loadDraftIntoForTest(io: std.Io, dir: *std.Io.Dir, model: *Model) void {
     applyStashedDraft(model, stashed);
 }
 
-/// Where a note the signer refused went.
-const DraftBack = enum {
-    /// Into an empty composer, as it was.
-    restored,
-    /// Under what the reader has typed since, after a blank line.
-    below,
-    /// Neither fit, so it waits to be copied to the clipboard on the next tick.
-    clipboard,
+// ---------------------------------------------------------------- refused text
+//
+// A note or reply a signer refused, or never answered, is the reader's words,
+// and it comes back by one rule wherever it was written.
+//
+// It goes back into its box only when the box is empty and nothing is held in
+// it for the post pause. Anything else in the box is the reader's, and joining
+// the refused text to it did three wrong things: a note held in its pause went
+// out with the refused one inside it, the box's text changed under a reader who
+// was typing (the editor adopts new text with its caret at the end), and when
+// the two did not fit the clipboard was written without anyone asking.
+//
+// Otherwise it is kept aside here, in memory, and a line under the box says how
+// many are kept, with a press that copies them all and one that lets them go.
+// The clipboard is written only by that press. A note's content warning stays
+// with its own text.
+
+/// Which box a refused text was written in.
+pub const RefusedBox = enum(u8) { note, reply };
+
+/// Where a refused text went, so what is said about it is true.
+pub const RefusedBack = enum {
+    /// Into its empty box, as it was.
+    box,
+    /// A reply whose thread is not open: kept for that thread, in its box or
+    /// beside it, for when the reader goes back.
+    thread,
+    /// Kept aside, under its box.
+    aside,
+    /// Kept aside was full, so it could not be kept.
+    full,
 };
 
-/// A refused note that did not fit the composer, waiting for the tick to copy
-/// it. Several can be refused in one sweep, so they queue up behind each other,
-/// and it holds as many as can be out at once, so none is ever dropped here.
-var g_refused_draft: [(compose_capacity + 2) * (max_pending_remote + 1)]u8 = undefined;
+/// How many are kept aside at most. Sized so all of them, a blank line between
+/// each, fit on the clipboard in one copy: the toolkit refuses a copy over 64
+/// KiB outright, and a Copy that does nothing would lose them all at once.
+pub const refused_slots = 12;
+comptime {
+    std.debug.assert(refused_slots * (compose_capacity + 2) <= native_sdk.max_effect_clipboard_bytes);
+}
 
-var g_refused_draft_len: usize = 0;
+const RefusedText = struct {
+    box: RefusedBox = .note,
+    /// The thread a reply answers. Zero for a note.
+    root: [32]u8 = @splat(0),
+    /// A note's own content warning, never lent to anything else.
+    warn: WarnCarry = .{},
+    len: usize = 0,
+    text: [compose_capacity]u8 = undefined,
+};
+
+var g_refused: [refused_slots]RefusedText = [_]RefusedText{.{}} ** refused_slots;
+var g_refused_len: usize = 0;
+/// One copy of everything kept for a box, built when Copy is pressed.
+var g_refused_copy: [refused_slots * (compose_capacity + 2)]u8 = undefined;
 
 /// Gives a note the signer refused back to the reader, and never at the cost
-/// of what they have typed since.
-///
-/// It used to go back only into an empty composer and was freed otherwise, so a
-/// reader who had started the next note lost the one that was refused. Now what
-/// was typed since stays first and the refused note goes under it, after a
-/// blank line. When the two do not fit together the box is left exactly as it
-/// is and the refused note goes to the clipboard instead, and the toast says so
-/// only once it is there.
-pub fn giveDraftBack(model: *Model, text: []const u8, warn: WarnCarry) DraftBack {
-    if (model.draft_empty()) {
+/// of what is in the composer now.
+pub fn giveDraftBack(model: *Model, text: []const u8, warn: WarnCarry) RefusedBack {
+    if (model.draft_empty() and compose.g_post_due_s == 0) {
         setPlain(compose_capacity, &model.draft_buffer, text);
         warn.restoreInto(model);
-        return .restored;
+        return .box;
     }
-    const typed = model.draft();
-    if (typed.len + 2 + text.len <= compose_capacity) {
-        var joined: [compose_capacity]u8 = undefined;
-        @memcpy(joined[0..typed.len], typed);
-        @memcpy(joined[typed.len..][0..2], "\n\n");
-        @memcpy(joined[typed.len + 2 ..][0..text.len], text);
-        setPlain(compose_capacity, &model.draft_buffer, joined[0 .. typed.len + 2 + text.len]);
-        // The refused note was covered by a warning. Joined to a draft without
-        // one it would go out uncovered, so the warning comes with it; a warning
-        // the reader set themselves is theirs and stays.
-        if (!model.warn_on) warn.restoreInto(model);
-        return .below;
+    return keepRefused(.note, @splat(0), text, warn);
+}
+
+/// Puts a reply the signer refused back where the reader can find it.
+///
+/// The reply box belongs to whatever thread is open NOW, so a reply to another
+/// thread never goes into it: it would read as an answer to somebody else, one
+/// press from being sent there. It is kept for its own thread instead, the way
+/// a reply left in a thread is, unless that thread already keeps one.
+pub fn putBackRefusedReply(model: *Model, root: [32]u8, text: []const u8) RefusedBack {
+    if (model.viewing_thread != 0 and std.mem.eql(u8, &model.thread_root.event_id, &root)) {
+        if (model.reply_empty() and compose.g_reply_due_s == 0) {
+            model.reply_buffer.set(text);
+            return .box;
+        }
+        return keepRefused(.reply, root, text, .{});
     }
-    const sep: usize = if (g_refused_draft_len > 0) 2 else 0;
+    if (keptReplyDraft(root) == null) {
+        keepReplyDraft(root, text, false);
+        return .thread;
+    }
+    return switch (keepRefused(.reply, root, text, .{})) {
+        .aside => .thread,
+        else => |back| back,
+    };
+}
+
+/// What to say about a refused note, by where it went.
+pub fn refusedNoteToast(back: RefusedBack) []const u8 {
+    return switch (back) {
+        .box => "Not signed. Your draft is back.",
+        // A note is never kept for a thread; said as if it were aside.
+        .aside, .thread => "Not signed. It is kept in the composer.",
+        .full => "Not signed, and no room is left to keep it.",
+    };
+}
+
+fn keepRefused(box: RefusedBox, root: [32]u8, text: []const u8, warn: WarnCarry) RefusedBack {
+    if (g_refused_len == g_refused.len) return .full;
+    const slot = &g_refused[g_refused_len];
     const n = @min(text.len, compose_capacity);
-    if (sep > 0) @memcpy(g_refused_draft[g_refused_draft_len..][0..2], "\n\n");
-    @memcpy(g_refused_draft[g_refused_draft_len + sep ..][0..n], text[0..n]);
-    g_refused_draft_len += sep + n;
-    return .clipboard;
+    slot.* = .{ .box = box, .root = root, .warn = warn, .len = n };
+    @memcpy(slot.text[0..n], text[0..n]);
+    g_refused_len += 1;
+    return .aside;
 }
 
-/// The tick's half: copies a refused note that fit nowhere, and only then says
-/// where it is.
-pub fn copyRefusedDraft(model: *Model, fx: *Effects) void {
-    if (g_refused_draft_len == 0) return;
-    writeClipboardText(fx, refused_draft_clip_key, g_refused_draft[0..g_refused_draft_len]);
-    g_refused_draft_len = 0;
-    setToast(model, "Not signed. No room, so it is on the clipboard.");
+/// The thread whose refused replies show under the reply box: the open one.
+fn refusedRoot(model: *const Model, box: RefusedBox) [32]u8 {
+    return if (box == .reply) model.thread_root.event_id else @splat(0);
 }
 
-pub fn copyRefusedDraftForTest(model: *Model, fx: *Effects) void {
-    copyRefusedDraft(model, fx);
+fn refusedIsFor(r: *const RefusedText, box: RefusedBox, root: [32]u8) bool {
+    return r.box == box and (box == .note or std.mem.eql(u8, &r.root, &root));
+}
+
+/// How many refused texts are kept for this box: every refused note for the
+/// composer, and the open thread's refused replies for the reply box.
+pub fn refusedCount(model: *const Model, box: RefusedBox) usize {
+    if (box == .reply and model.viewing_thread == 0) return 0;
+    const root = refusedRoot(model, box);
+    var n: usize = 0;
+    for (g_refused[0..g_refused_len]) |*r| {
+        if (refusedIsFor(r, box, root)) n += 1;
+    }
+    return n;
+}
+
+/// Whether the next refused text would find no room.
+pub fn refusedFull() bool {
+    return g_refused_len == g_refused.len;
+}
+
+/// Copy: every text kept for this box, oldest first and a blank line apart, to
+/// the clipboard, and then they are let go. The only place a refused text is
+/// written to the clipboard.
+pub fn copyRefused(model: *Model, fx: *Effects, box: RefusedBox) void {
+    const root = refusedRoot(model, box);
+    var len: usize = 0;
+    var warned = false;
+    for (g_refused[0..g_refused_len]) |*r| {
+        if (!refusedIsFor(r, box, root)) continue;
+        if (len > 0) {
+            @memcpy(g_refused_copy[len..][0..2], "\n\n");
+            len += 2;
+        }
+        @memcpy(g_refused_copy[len..][0..r.len], r.text[0..r.len]);
+        len += r.len;
+        warned = warned or r.warn.on;
+    }
+    if (len == 0) return;
+    // The toolkit copies the text when it is handed over, so the copy here can
+    // be wiped at once.
+    writeClipboardText(fx, refused_text_clip_key, g_refused_copy[0..len]);
+    @memset(g_refused_copy[0..len], 0);
+    dropRefused(box, root);
+    // The warning cannot ride on the clipboard, so it is said instead.
+    setToast(model, if (warned) "Copied. Set its content warning again." else "Copied");
+}
+
+/// Dismiss: lets go of every text kept for this box.
+pub fn dismissRefused(model: *const Model, box: RefusedBox) void {
+    dropRefused(box, refusedRoot(model, box));
+}
+
+fn dropRefused(box: RefusedBox, root: [32]u8) void {
+    var kept: usize = 0;
+    for (0..g_refused_len) |i| {
+        if (refusedIsFor(&g_refused[i], box, root)) continue;
+        if (kept != i) g_refused[kept] = g_refused[i];
+        kept += 1;
+    }
+    // Wiped, not only released: it is the reader's unsent writing.
+    for (g_refused[kept..g_refused_len]) |*r| {
+        @memset(&r.text, 0);
+        r.* = .{};
+    }
+    g_refused_len = kept;
+}
+
+/// Forgets every refused text, for a session that is ending.
+pub fn forgetRefused() void {
+    for (g_refused[0..g_refused_len]) |*r| {
+        @memset(&r.text, 0);
+        r.* = .{};
+    }
+    g_refused_len = 0;
+}
+
+/// The texts kept aside, oldest first, for a test of what is held and where.
+pub fn refusedTextForTest(index: usize) ?[]const u8 {
+    if (index >= g_refused_len) return null;
+    return g_refused[index].text[0..g_refused[index].len];
+}
+
+pub fn refusedWarnForTest(index: usize) ?WarnCarry {
+    if (index >= g_refused_len) return null;
+    return g_refused[index].warn;
 }

@@ -70,3 +70,82 @@ test "a draft saved to disk keeps its content warning, and loses it with the dra
     main.loadDraftIntoForTest(io, &tmp.dir, &fresh);
     try testing.expect(!fresh.warn_on);
 }
+
+test "refused notes wait beside the composer until Copy, and only Copy writes the clipboard" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    defer main.forgetRefused();
+    main.clearLastClipboardForTest();
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    model.draft_buffer.set("what I am typing");
+
+    // Two refused, one of them covered. Neither touches the box or its
+    // warning, and the clipboard is left alone.
+    const covered = main.WarnCarry.fromTags(&.{&.{ "content-warning", "spoilers" }});
+    try testing.expectEqual(main.RefusedBack.aside, main.giveDraftBack(&model, "the first", .{}));
+    try testing.expectEqual(main.RefusedBack.aside, main.giveDraftBack(&model, "the second", covered));
+    try testing.expectEqualStrings("what I am typing", model.draft());
+    try testing.expect(!model.warn_on);
+    try testing.expectEqualStrings("", main.lastClipboardForTest());
+    // The warning stays with its own text.
+    try testing.expect(!main.refusedWarnForTest(0).?.on);
+    try testing.expect(main.refusedWarnForTest(1).?.on);
+
+    // The composer says how many, with the two presses.
+    const tree = try harness.buildTree(arena, &model);
+    try testing.expect(harness.findAnyTextContaining(tree.root, "2 notes were not signed. They are kept here."));
+    try testing.expect(harness.pressableByLabel(tree, tree.root, "Copy the notes that were not signed"));
+    try testing.expect(harness.pressableByLabel(tree, tree.root, "Dismiss the notes that were not signed"));
+
+    // Copy: both, oldest first, and the warning that could not come along is
+    // said instead. The line goes with them.
+    main.update(&model, .{ .refused_copy = .note }, &fx);
+    try testing.expectEqualStrings("the first\n\nthe second", main.lastClipboardForTest());
+    try testing.expectEqualStrings("Copied. Set its content warning again.", model.toast_text());
+    try testing.expectEqual(@as(usize, 0), main.refusedCount(&model, .note));
+    try testing.expect(!harness.findAnyTextContaining((try harness.buildTree(arena, &model)).root, "not signed"));
+
+    // Dismiss lets them go and writes nothing.
+    main.clearLastClipboardForTest();
+    _ = main.giveDraftBack(&model, "let go of", .{});
+    main.update(&model, .{ .refused_dismiss = .note }, &fx);
+    try testing.expectEqual(@as(usize, 0), main.refusedCount(&model, .note));
+    try testing.expectEqualStrings("", main.lastClipboardForTest());
+
+    // An empty composer takes a refused note back with its warning.
+    model.draft_buffer.clear();
+    try testing.expectEqual(main.RefusedBack.box, main.giveDraftBack(&model, "the covered one", covered));
+    try testing.expectEqualStrings("the covered one", model.draft());
+    try testing.expect(model.warn_on);
+    try testing.expectEqualStrings("spoilers", model.warn_draft());
+}
+
+test "kept refused notes stop at a cap that fits one copy, and say so" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    defer main.forgetRefused();
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.composing = true;
+    model.draft_buffer.set("typing");
+
+    var long: [main.compose_capacity_for_test]u8 = undefined;
+    @memset(&long, 'z');
+    for (0..main.refused_slots) |_| {
+        try testing.expectEqual(main.RefusedBack.aside, main.giveDraftBack(&model, &long, .{}));
+    }
+    try testing.expectEqual(main.RefusedBack.full, main.giveDraftBack(&model, "one too many", .{}));
+    const tree = try harness.buildTree(arena_state.allocator(), &model);
+    try testing.expect(harness.findAnyTextContaining(tree.root, "No room for more."));
+
+    // All of them, at their longest, fit in the one copy the toolkit accepts.
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .{ .refused_copy = .note }, &fx);
+    const copied = main.lastClipboardForTest();
+    try testing.expectEqual(main.refused_slots * long.len + (main.refused_slots - 1) * 2, copied.len);
+    try testing.expect(copied.len <= native_sdk.max_effect_clipboard_bytes);
+}

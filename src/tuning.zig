@@ -185,9 +185,8 @@ pub const copy_nevent_key: u64 = 103;
 pub const copy_nprofile_key: u64 = 105;
 pub const copy_note_text_key: u64 = 104;
 
-pub const refused_draft_clip_key: u64 = 106;
-
-pub const copy_refused_reply_key: u64 = 106;
+// Copy, under a box that keeps the notes or replies a signer refused.
+pub const refused_text_clip_key: u64 = 106;
 // The update check. One at a time, so one key rather than a base.
 pub const update_check_key: u64 = 110;
 // Image fetches use effect keys `<base> + slot`, kept clear of the timer and

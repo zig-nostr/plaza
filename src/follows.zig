@@ -1114,10 +1114,9 @@ pub fn applyUndo(model: *Model, undo: PendingUndo) void {
             defer std.heap.page_allocator.free(r.text);
             setToast(model, switch (putBackRefusedReply(model, r.root, r.text)) {
                 .box => "Not signed. Your reply is back.",
-                .box_below => "Not signed. Reply put back under your new text.",
-                .kept => "Not signed. Reply kept in its thread.",
-                .kept_below => "Not signed. Reply kept under the newer one.",
-                .copied => "Not signed. Reply did not fit back, so copied.",
+                .thread => "Not signed. Reply kept in its thread.",
+                .aside => "Not signed. Reply kept under the box.",
+                .full => "Not signed, and no room is left to keep it.",
             });
         },
         .profile => {

@@ -17,6 +17,7 @@ const geometry = native_sdk.geometry;
 
 // ---- from main.zig
 const giveDraftBack = main.giveDraftBack;
+const refusedNoteToast = main.refusedNoteToast;
 const PendingUndo = main.PendingUndo;
 const copyBounded = main.copyBounded;
 const Effects = main.Effects;
@@ -839,18 +840,13 @@ pub fn scanHelperSign(model: *Model) void {
     if (upload_auth) uploadSignFailed();
     if (content) |c| {
         // A reader who has started typing again keeps what they are typing,
-        // first; see `giveDraftBack`.
+        // untouched; see `giveDraftBack`.
         if (restorable) {
-            switch (giveDraftBack(model, c, warn)) {
-                // Said out loud, because the notice this used to rely on cannot
-                // be read: its string lives in `Model.identity()`, which is
-                // listed in `view_unbound` and rendered by nothing. A toast is
-                // the surface every other failed write now uses.
-                .restored => setToast(model, "Not signed. Your draft is back."),
-                .below => setToast(model, "Not signed. It is back, under what you typed."),
-                // The toast comes with the copy, on the next tick.
-                .clipboard => {},
-            }
+            // Said out loud, because the notice this used to rely on cannot
+            // be read: its string lives in `Model.identity()`, which is listed
+            // in `view_unbound` and rendered by nothing. A toast is the surface
+            // every other failed write now uses.
+            setToast(model, refusedNoteToast(giveDraftBack(model, c, warn)));
             saveDraft(model.draft(), draftWarningOf(model));
         }
         gpa.free(c);

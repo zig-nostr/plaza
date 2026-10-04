@@ -56,14 +56,24 @@ test "a refused reply goes back to its own thread, never into the open one" {
     try testing.expectEqualStrings("an answer to a", model.reply_draft());
 
     // And a refusal never writes over a reply typed since: the first thread's
-    // new reply is kept first, and the late one goes under it.
+    // new reply stays exactly as it was, and the late one is kept beside it.
+    defer main.forgetRefused();
     model.reply_buffer.set("typed since");
     main.closeThreadForTest(&model);
     const late = try std.heap.page_allocator.dupe(u8, "the refused one");
     main.armUndoForTest(.{ .reply = .{ .text = late, .root = a.event_id } });
     main.applyUndoForTest(&model);
-    try testing.expectEqualStrings("typed since\n\nthe refused one", main.keptReplyDraftForTest(a.event_id).?);
-    try testing.expectEqualStrings("Not signed. Reply kept under the newer one.", model.toast_text());
+    try testing.expectEqualStrings("typed since", main.keptReplyDraftForTest(a.event_id).?);
+    try testing.expectEqualStrings("the refused one", main.refusedTextForTest(0).?);
+    try testing.expectEqualStrings("Not signed. Reply kept in its thread.", model.toast_text());
+
+    // It shows under its own thread's box, and under no other.
+    main.enterThreadForTest(&model, b);
+    try testing.expectEqual(@as(usize, 0), main.refusedCount(&model, .reply));
+    main.closeThreadForTest(&model);
+    main.enterThreadForTest(&model, a);
+    try testing.expectEqualStrings("typed since", model.reply_draft());
+    try testing.expectEqual(@as(usize, 1), main.refusedCount(&model, .reply));
 }
 
 test "a bunker's refused reply comes back, and the like pressed after it stays" {
@@ -162,46 +172,93 @@ test "a reply waits for Notary to finish the sign it is already doing" {
     try testing.expectEqualStrings("the note being signed", model.draft());
 }
 
-test "a refused reply is never dropped, and never said to be back when it is not" {
+test "a refused reply never changes a box with something in it" {
+    // It used to be joined under what the reader had typed since. The box's
+    // text changed under a reader who was typing, which moved their caret to
+    // the end, and when the two did not fit the clipboard was written unasked.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
     main.setIdentityForTest([_]u8{0x84} ** 32);
     defer main.clearIdentityForTest();
     var model = main.initialModel();
     model.stage = .ready;
     var fx: main.EffectsForTest = undefined;
     defer main.performLogoutForTest(&model, &fx);
+    defer main.forgetRefused();
+    main.clearLastClipboardForTest();
     const a = bareRoot(0xa4);
 
-    // Its thread is open and the reader has started another reply. The box
-    // keeps what they typed, first, and the refused one goes under it.
     main.enterThreadForTest(&model, a);
     model.reply_buffer.set("started again");
     main.armUndoForTest(.{ .reply = .{ .text = try std.heap.page_allocator.dupe(u8, "the first try"), .root = a.event_id } });
     main.applyUndoForTest(&model);
-    try testing.expectEqualStrings("started again\n\nthe first try", model.reply_draft());
-    try testing.expectEqualStrings("Not signed. Reply put back under your new text.", model.toast_text());
+    try testing.expectEqualStrings("started again", model.reply_draft());
+    try testing.expectEqualStrings("the first try", main.refusedTextForTest(0).?);
+    try testing.expectEqualStrings("Not signed. Reply kept under the box.", model.toast_text());
+    try testing.expectEqualStrings("", main.lastClipboardForTest());
 
-    // The two do not fit in one reply. The box is left as it was, the refused
-    // one is held for the clipboard, and the toast says that, not "back".
-    const cap = main.compose_capacity_for_test;
-    const long = try testing.allocator.alloc(u8, cap - 8);
-    defer testing.allocator.free(long);
-    @memset(long, 'x');
-    model.reply_buffer.set(long);
-    main.armUndoForTest(.{ .reply = .{ .text = try std.heap.page_allocator.dupe(u8, "no room for me"), .root = a.event_id } });
-    main.applyUndoForTest(&model);
-    try testing.expectEqualStrings(long, model.reply_draft());
-    try testing.expectEqualStrings("no room for me", main.refusedReplyClipForTest());
-    try testing.expectEqualStrings("Not signed. Reply did not fit back, so copied.", model.toast_text());
+    // The line under the box says so, and Copy is the one way to the clipboard.
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findAnyTextContainingText(tree.root, "1 reply was not signed") != null);
+    try testing.expect(harness.pressableByLabel(tree, tree.root, "Copy the replies that were not signed"));
+    main.update(&model, .{ .refused_copy = .reply }, &fx);
+    try testing.expectEqualStrings("the first try", main.lastClipboardForTest());
+    try testing.expectEqual(@as(usize, 0), main.refusedCount(&model, .reply));
+    try testing.expectEqualStrings("started again", model.reply_draft());
+    const after = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findAnyTextContainingText(after.root, "was not signed") == null);
 
-    // The same when the reader has left the thread and its kept reply is long.
-    main.goHomeForTest(&model);
-    try testing.expectEqualStrings(long, main.keptReplyDraftForTest(a.event_id).?);
-    main.armUndoForTest(.{ .reply = .{ .text = try std.heap.page_allocator.dupe(u8, "still no room"), .root = a.event_id } });
+    // An empty box takes it back, as it was.
+    model.reply_buffer.clear();
+    main.armUndoForTest(.{ .reply = .{ .text = try std.heap.page_allocator.dupe(u8, "the second try"), .root = a.event_id } });
     main.applyUndoForTest(&model);
-    try testing.expectEqualStrings(long, main.keptReplyDraftForTest(a.event_id).?);
-    try testing.expectEqualStrings("still no room", main.refusedReplyClipForTest());
-    try testing.expectEqualStrings("Not signed. Reply did not fit back, so copied.", model.toast_text());
+    try testing.expectEqualStrings("the second try", model.reply_draft());
+    try testing.expectEqualStrings("Not signed. Your reply is back.", model.toast_text());
+    try testing.expectEqual(@as(usize, 0), main.refusedCount(&model, .reply));
 }
+
+test "a reply held in its pause goes alone, and a refused one beside it is never sent" {
+    main.setIdentityForTest([_]u8{0x86} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    var fx: main.EffectsForTest = undefined;
+    defer main.performLogoutForTest(&model, &fx);
+    defer main.forgetRefused();
+    const a = bareRoot(0xa6);
+
+    // The reader pressed Reply with the pause on, and while it counts an
+    // earlier reply to the same thread comes back refused.
+    main.enterThreadForTest(&model, a);
+    model.reply_buffer.set("the held reply");
+    main.holdReplyForTest(1_800_000_000);
+    main.armUndoForTest(.{ .reply = .{ .text = try std.heap.page_allocator.dupe(u8, "the earlier reply"), .root = a.event_id } });
+    main.applyUndoForTest(&model);
+    try testing.expectEqualStrings("the held reply", model.reply_draft());
+
+    // The pause runs out. What goes is what was held, and nothing else.
+    main.fireReply(&model, &fx, null);
+    const out = main.lastPublishedForTest() orelse return error.NothingPublished;
+    try testing.expectEqualStrings("the held reply", out.content);
+    try testing.expectEqualStrings("the earlier reply", main.refusedTextForTest(0).?);
+
+    // A box emptied while its reply is held is still holding: a refused reply
+    // put in it would go out when the pause ran out, and nobody pressed Reply
+    // on it.
+    main.forgetLastPublishedForTest();
+    model.reply_buffer.set("held again");
+    main.holdReplyForTest(1_800_000_000);
+    model.reply_buffer.clear();
+    main.armUndoForTest(.{ .reply = .{ .text = try std.heap.page_allocator.dupe(u8, "refused again"), .root = a.event_id } });
+    main.applyUndoForTest(&model);
+    try testing.expect(model.reply_empty());
+    main.fireReply(&model, &fx, null);
+    try testing.expect(main.lastPublishedForTest() == null);
+    try testing.expectEqualStrings("refused again", main.refusedTextForTest(1).?);
+}
+
 test "replies from outside the follow graph are held below, not dropped" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

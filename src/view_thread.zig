@@ -114,6 +114,8 @@ const quote_skeleton_height = main.quote_skeleton_height;
 const refreshAncestorChain = main.refreshAncestorChain;
 const relaysSeenFor = main.relaysSeenFor;
 const replyNotifyRow = main.replyNotifyRow;
+const refusedNote = main.refusedNote;
+const refusedCount = main.refusedCount;
 const replyTarget = main.replyTarget;
 const reply_editor_height = main.reply_editor_height;
 const reply_row_extent = main.reply_row_extent;
@@ -1791,6 +1793,13 @@ fn replyComposer(ui: *AppUi, model: *const Model, root: *const Note) AppUi.Node 
             hgap(ui, thread_inset + avatar_size + avatar_to_text_gap),
             replyNotifyRow(ui, model, root),
         }),
+        // Replies to this thread a signer refused, kept beside the box rather
+        // than put into it.
+        if (refusedCount(model, .reply) > 0) ui.row(.{ .gap = 0 }, .{
+            hgap(ui, thread_inset + avatar_size + avatar_to_text_gap),
+            ui.column(.{ .grow = 1, .gap = 0 }, .{refusedNote(ui, model, .reply)}),
+            hgap(ui, thread_inset),
+        }) else ui.spacer(0),
         vgap(ui, 10),
     });
 }

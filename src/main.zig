@@ -2823,6 +2823,11 @@ pub const Msg = union(enum) {
     close_image,
     /// Copy a note's words to the clipboard (by id).
     copy_note_text: i64,
+    /// Copy every note or reply kept under this box after a signer refused it,
+    /// and let them go.
+    refused_copy: drafts.RefusedBox,
+    /// Let them go without copying.
+    refused_dismiss: drafts.RefusedBox,
     quote_note: i64,
     toggle_mention_off: [32]u8,
     /// Put the mention picker away without choosing anybody.
@@ -2942,6 +2947,8 @@ pub const Msg = union(enum) {
         "absorb_press",
         "open_notary_window",
         "copy_note_text",
+        "refused_copy",
+        "refused_dismiss",
         "quote_note",
         "close_mentions",
         "open_address",
@@ -3575,9 +3582,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // back.
                 if (postIsDue(compose.g_post_due_s, nowSeconds())) _ = firePost(model, fx, compose.g_held_route);
                 if (postIsDue(compose.g_reply_due_s, nowSeconds())) fireReply(model, fx, compose.g_held_route);
-                // A refused note that fit nowhere last tick goes to the
-                // clipboard now.
-                copyRefusedDraft(model, fx);
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
                 if (keyholder.g_signer_kind == .remote) scanPendingRemote(model, fx);
@@ -3589,8 +3593,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // A record of the reader's own that went out and did not reach
                 // the store, offered to it again.
                 retryUnstoredOwnWrites(model, now);
-                // A refused reply with no room left to go back into.
-                flushRefusedReplyClip(fx);
                 // A relay that asked who the reader is, and was told yes: get
                 // the answer signed. The reader thread sends it.
                 driveRelayAuth(fx);
@@ -4301,6 +4303,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             }
         },
         .close_mentions => model.mention_dismissed = true,
+        .refused_copy => |box| copyRefused(model, fx, box),
+        .refused_dismiss => |box| dismissRefused(model, box),
         .copy_note_text => |id| {
             // The words as the note wrote them, not as the feed renders them:
             // a paste that came back with `@name` where the author typed a
@@ -4717,10 +4721,13 @@ pub fn writeClipboardText(fx: *Effects, key: u64, text: []const u8) void {
     }
     fx.writeClipboard(.{ .key = key, .text = text });
 }
-var g_last_clipboard: [@max(note_address_cap, compose_capacity)]u8 = undefined;
+var g_last_clipboard: [native_sdk.max_effect_clipboard_bytes]u8 = undefined;
 var g_last_clipboard_len: usize = 0;
 pub fn lastClipboardForTest() []const u8 {
     return g_last_clipboard[0..g_last_clipboard_len];
+}
+pub fn clearLastClipboardForTest() void {
+    g_last_clipboard_len = 0;
 }
 
 pub fn setToast(model: *Model, text: []const u8) void {
@@ -5083,8 +5090,7 @@ fn openFeedStore(io: std.Io, environ: *const std.process.Environ.Map) !nostr.sto
 }
 
 // re-exports: tuning.zig
-pub const refused_draft_clip_key = tuning.refused_draft_clip_key;
-pub const copy_refused_reply_key = tuning.copy_refused_reply_key;
+pub const refused_text_clip_key = tuning.refused_text_clip_key;
 pub const ancestor_row_chrome_for_test = tuning.ancestor_row_chrome_for_test;
 pub const compose_capacity_for_test = tuning.compose_capacity_for_test;
 pub const compose_editor_width_for_test = tuning.compose_editor_width_for_test;
@@ -6543,12 +6549,19 @@ pub const takeAnswered = remote_signer.takeAnswered;
 pub const takePending = remote_signer.takePending;
 
 // re-exports: drafts.zig
-pub const copyRefusedDraft = drafts.copyRefusedDraft;
-pub const copyRefusedDraftForTest = drafts.copyRefusedDraftForTest;
+pub const RefusedBox = drafts.RefusedBox;
+pub const RefusedBack = drafts.RefusedBack;
+pub const copyRefused = drafts.copyRefused;
+pub const dismissRefused = drafts.dismissRefused;
+pub const forgetRefused = drafts.forgetRefused;
 pub const giveDraftBack = drafts.giveDraftBack;
-pub const refusedReplyClipForTest = drafts.refusedReplyClipForTest;
-pub const flushRefusedReplyClip = drafts.flushRefusedReplyClip;
 pub const putBackRefusedReply = drafts.putBackRefusedReply;
+pub const refusedCount = drafts.refusedCount;
+pub const refusedFull = drafts.refusedFull;
+pub const refusedNoteToast = drafts.refusedNoteToast;
+pub const refused_slots = drafts.refused_slots;
+pub const refusedTextForTest = drafts.refusedTextForTest;
+pub const refusedWarnForTest = drafts.refusedWarnForTest;
 pub const draftWarningForModelForTest = drafts.draftWarningForModelForTest;
 pub const keptReplyDraftForTest = drafts.keptReplyDraftForTest;
 pub const loadDraftIntoForTest = drafts.loadDraftIntoForTest;
@@ -7241,6 +7254,7 @@ pub const composeSheet = view_compose.composeSheet;
 pub const insertMention = view_compose.insertMention;
 pub const mentionQuery = view_compose.mentionQuery;
 pub const replyNotifyRow = view_compose.replyNotifyRow;
+pub const refusedNote = view_compose.refusedNote;
 
 // re-exports: view_notifications.zig
 pub const notificationRowForTest = view_notifications.notificationRowForTest;

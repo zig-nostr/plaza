@@ -45,6 +45,9 @@ const notifiedBy = main.notifiedBy;
 const nowSeconds = main.nowSeconds;
 const personName = main.personName;
 const postSecondsLeft = main.postSecondsLeft;
+const RefusedBox = main.RefusedBox;
+const refusedCount = main.refusedCount;
+const refusedFull = main.refusedFull;
 const pressRow = main.pressRow;
 const settings_card_radius = main.settings_card_radius;
 const settings_header_height = main.settings_header_height;
@@ -116,6 +119,7 @@ pub fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                             }),
                         }),
                     }),
+                    refusedNote(ui, model, .note),
                     composeNotifyRow(ui, model),
                     composeWarningRow(ui, model),
                     vgap(ui, 10),
@@ -143,6 +147,60 @@ pub fn composeSheet(ui: *AppUi, model: *const Model) AppUi.Node {
                     vgap(ui, 18),
                 }),
                 ui.spacer(1),
+            }),
+        }),
+    });
+}
+
+/// The line under a box that keeps notes or replies a signer refused: how many,
+/// a press that copies them all, and one that lets them go. Nothing at all when
+/// none are kept.
+///
+/// A line beside the box rather than a toast, because the composer is a page
+/// drawn over the toast, and rather than the box itself, because what is in
+/// the box is the reader's and stays exactly as they left it. The two verbs
+/// wear the update line's shape.
+pub fn refusedNote(ui: *AppUi, model: *const Model, box: RefusedBox) AppUi.Node {
+    const p = theme.palette;
+    const n = refusedCount(model, box);
+    if (n == 0) return ui.spacer(0);
+    const what = switch (box) {
+        .note => if (n == 1) "1 note was not signed. It is kept here." else ui.fmt("{d} notes were not signed. They are kept here.", .{n}),
+        .reply => if (n == 1) "1 reply was not signed. It is kept here." else ui.fmt("{d} replies were not signed. They are kept here.", .{n}),
+    };
+    const noun = if (box == .note) "notes" else "replies";
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 10),
+        ui.row(.{ .cross = .center, .gap = 0 }, .{
+            ui.paragraph(
+                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.status_warning_text } },
+                &.{.{ .text = if (refusedFull()) ui.fmt("{s} No room for more.", .{what}) else what, .scale = stat_scale }},
+            ),
+            hgap(ui, 10),
+            pressRow(ui, .{
+                .cross = .center,
+                .gap = 0,
+                .on_press = Msg{ .refused_copy = box },
+                .style = .{ .quiet_hover = true },
+                .semantics = .{ .role = .button, .label = ui.fmt("Copy the {s} that were not signed", .{noun}), .focusable = true },
+            }, .{
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_primary } },
+                    &.{.{ .text = "Copy", .weight = .medium, .underline = true, .scale = stat_scale }},
+                ),
+            }),
+            hgap(ui, 12),
+            pressRow(ui, .{
+                .cross = .center,
+                .gap = 0,
+                .on_press = Msg{ .refused_dismiss = box },
+                .style = .{ .quiet_hover = true },
+                .semantics = .{ .role = .button, .label = ui.fmt("Dismiss the {s} that were not signed", .{noun}), .focusable = true },
+            }, .{
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_muted } },
+                    &.{.{ .text = "Dismiss", .scale = stat_scale }},
+                ),
             }),
         }),
     });

@@ -15,6 +15,7 @@ const geometry = native_sdk.geometry;
 
 // ---- from main.zig
 const giveDraftBack = main.giveDraftBack;
+const refusedNoteToast = main.refusedNoteToast;
 const oneShotDeadline = main.oneShotDeadline;
 const withdrawLiveRelay = main.withdrawLiveRelay;
 const takeDownBunkerListener = main.takeDownBunkerListener;
@@ -1227,9 +1228,9 @@ pub fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
 
     for (restores[0..restores_len], restore_warns[0..restores_len]) |c, w| {
         switch (giveDraftBack(model, c, w)) {
-            .restored => {},
-            .below => setToast(model, "Not signed. It is back, under what you typed."),
-            .clipboard => {},
+            // The composer's own notice says this one.
+            .box => {},
+            else => |back| setToast(model, refusedNoteToast(back)),
         }
         gpa.free(c);
     }
