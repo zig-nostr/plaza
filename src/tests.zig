@@ -31698,3 +31698,41 @@ test "pasting a bunker link waits for the signer instead of signing in" {
     try testing.expect(!model.is_guest());
     try testing.expect(!model.joining and !model.bunker_mode);
 }
+
+test "creating an identity with no key window says so instead of queueing a mint the daemon refuses" {
+    // The daemon will not make a key without a passphrase, and the passphrase
+    // is typed into Notary's window. With the window absent the press queued a
+    // setup that came back "passphrase required" over a sheet that had already
+    // closed: nothing happened, and nothing said why.
+    main.clearIdentityForTest();
+    defer main.clearIdentityForTest();
+    main.setKeyholderMissingForTest(false);
+    main.setNotaryWindowFoundForTest(false);
+    defer main.setNotaryWindowFoundForTest(false);
+    main.setHelperUnreachableForTest();
+    defer main.setHelperUnreachableForTest();
+    try testing.expect(!main.helperSetupQueuedForTest());
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .join_create, &fx);
+
+    try testing.expect(!main.helperSetupQueuedForTest());
+    try testing.expect(model.is_guest());
+    try testing.expect(std.mem.indexOf(u8, model.toast_text(), "key window is missing") != null);
+
+    // The welcome screen's button goes through the same door.
+    model.toast_until = 0;
+    main.update(&model, .create_identity, &fx);
+    try testing.expect(!main.helperSetupQueuedForTest());
+    try testing.expect(std.mem.indexOf(u8, model.toast_text(), "key window is missing") != null);
+
+    // And with no keyholder at all it is still a said refusal, not a silent one.
+    main.setKeyholderMissingForTest(true);
+    defer main.setKeyholderMissingForTest(false);
+    model.toast_until = 0;
+    main.update(&model, .join_create, &fx);
+    try testing.expectEqualStrings("Notary is missing from this install.", model.toast_text());
+}

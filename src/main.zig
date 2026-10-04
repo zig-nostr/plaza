@@ -6168,35 +6168,37 @@ fn handleHelperSetup(model: *Model, response: native_sdk.EffectResponse) void {
     }
 }
 
-/// Starts making a key, in the Notary window when there is one.
+/// Starts making a key, in the Notary window.
 ///
-/// The fallback is not a lesser version of the same thing, it is the path this
-/// app shipped with: Plaza asks the daemon directly and the daemon mints. The
-/// key never enters Plaza either way. What the window adds is that the reader
-/// SEES the separate process that holds their key, once, at the moment it starts
-/// holding it. Worth a window; not worth a dead button when the binary is absent
-/// (a dev tree with the sub-project unbuilt, a broken bundle).
-fn beginCreate(fx: *Effects) void {
+/// The window is the only place a key can be made. The daemon will not mint one
+/// without a passphrase, and the passphrase is typed into the window: Plaza
+/// never sees it and never asks for it. There used to be a fallback that asked
+/// the daemon directly when the window binary was absent, and with a passphrase
+/// now mandatory the daemon answered it with a bare "passphrase required" that
+/// showed for three seconds over a sheet that had already closed.
+fn beginCreate(model: *Model, fx: *Effects) void {
     // Nothing can mint a key without the daemon that would hold it: Plaza has
     // not held one itself since the key moved out of this process. The ladder
     // says so in place of the card, but the guard belongs HERE, because this is
     // the one function every create path goes through, and what it prevents is
-    // an intent queued against a binary that will never appear. `queueHelperSetup`
-    // waits for reachability, and a missing keyholder never becomes reachable,
-    // so without this the reader's press is swallowed whole and the sheet closes
-    // over nothing.
-    if (keyholderMissing()) return;
-    if (g_notary_win_len == 0) {
-        queueHelperSetup(fx, .create, null);
-        return;
-    }
-    // The ceremony is the other process's now, so what queueHelperSetup would
+    // an intent queued against a binary that will never appear. A missing
+    // keyholder never becomes reachable, so without this the reader's press is
+    // swallowed whole and the sheet closes over nothing.
+    if (keyholderMissing()) return setToast(model, "Notary is missing from this install.");
+    // And the same for the window: with no window there is nowhere to type the
+    // passphrase, so nothing is queued and the press says why it did nothing.
+    // The toast holds 48 bytes, which this fills exactly.
+    if (g_notary_win_len == 0) return setToast(model, "Notary's key window is missing from this install");
+    // The ceremony is the other process's now, so what a queued setup would
     // have done has to be done here: re-enable adopt-on-appear, which a logout
     // latches off.
     g_logged_out = false;
     g_ceremony = .running;
     g_ceremony_adopted = false;
-    _ = spawnNotaryWindow(fx, .create_key);
+    if (!spawnNotaryWindow(fx, .create_key)) {
+        g_ceremony = .none;
+        setToast(model, "Your keyholder is still starting. Try again.");
+    }
 }
 
 /// Deletes the legacy in-process key file, once its secret is safe in the daemon.
@@ -34302,7 +34304,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // and import an account with eight hundred follows instead. It is set
             // when a mint is CONFIRMED, in handleNotaryExited and in
             // handleHelperSetup's create branch.
-            beginCreate(fx);
+            beginCreate(model, fx);
         },
         .open_notary_import => {
             // Key material never enters Plaza: the Notary window takes the
@@ -34545,7 +34547,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.backup_nudge = false;
             model.backup_nudge_dismissed = true;
         },
-        .create_identity => beginCreate(fx),
+        .create_identity => beginCreate(model, fx),
         .login_edit => |edit| model.login_buffer.apply(edit),
         .login_submit => {
             g_login_error.store(@intFromEnum(LoginError.none), .release);
