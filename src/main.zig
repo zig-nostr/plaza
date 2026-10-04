@@ -6276,7 +6276,7 @@ var g_remote_sign_notice = std.atomic.Value(bool).init(false);
 const remote_sign_timeout_s: i64 = 30;
 const max_pending_remote = 8;
 const no_half_id = [_]u8{0} ** 32;
-const RemoteMethod = enum { connect, sign_event, nip44_decrypt, nip04_decrypt, nip44_encrypt };
+const RemoteMethod = enum { connect, sign_event, nip44_decrypt, nip04_decrypt, nip44_encrypt, sign_auth };
 const PendingRemote = struct {
     active: bool = false,
     id_buf: [24]u8 = undefined,
@@ -7114,6 +7114,8 @@ fn askProfileAt(url_buf: [place_relay_cap]u8, url_len: usize, pubkey: [32]u8) vo
         switch (msg.value) {
             .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
             .eose => break,
+            // A CLOSED ends this relay's part, and no EOSE is coming after it.
+            .closed => break,
             else => {},
         }
     }
@@ -8128,6 +8130,8 @@ fn askQuoteAt(url_buf: [place_relay_cap]u8, url_len: usize, id: [32]u8) void {
         switch (msg.value) {
             .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
             .eose => break,
+            // A CLOSED ends this relay's part, and no EOSE is coming after it.
+            .closed => break,
             else => {},
         }
     }
@@ -16335,6 +16339,14 @@ pub const Msg = union(enum) {
     profile_retry,
     /// Walks a relay through what it is for: both, read, write.
     relay_cycle: u8,
+    /// The notice's answer for relay slot N: identify to it.
+    auth_allow: u8,
+    /// The notice's answer for relay slot N: do not.
+    auth_deny: u8,
+    /// The relay row's badge: ask first, identify, anonymous.
+    auth_cycle: u8,
+    /// A NIP-42 signature came back from the keyholder.
+    helper_auth_signed: native_sdk.EffectResponse,
     /// Drops a relay from the pool.
     relay_remove: u8,
     /// The relay being typed into the add field.
@@ -16628,6 +16640,10 @@ pub const Msg = union(enum) {
         "profile_tab",
         "proxy_edit",
         "proxy_save",
+        "auth_allow",
+        "auth_deny",
+        "auth_cycle",
+        "helper_auth_signed",
         "relay_add",
         "relay_cycle",
         "relay_edit",
@@ -17227,6 +17243,8 @@ fn forgetRelaySlotState(i: usize) void {
     setRelayStatus(i, .offline);
     clearRelayRtt(i);
     forgetRelaySeen(i);
+    // What a relay asked of the last occupant is not a question for the next.
+    authSlotReset(i);
 }
 
 /// The URLs currently in the slots, so a table swap can tell which seats
@@ -17340,6 +17358,24 @@ fn relayListRow(ui: *AppUi, e: *const RelayEntry, index: usize, state: Conn) App
                 ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = badge, .monospace = true, .scale = mono_badge_scale }}),
                 hgap(ui, 5),
             }),
+            // Whether this relay may know who the reader is. Only once the
+            // relay has asked or the reader has said, so a row that never
+            // mentions identity does not grow a control about it.
+            if (authBadgeText(index, e.url())) |text| ui.row(.{ .cross = .center, .gap = 0 }, .{
+                hgap(ui, 6),
+                ui.el(.list_item, .{
+                    .padding = 0.01,
+                    .height = 20,
+                    .cross = .center,
+                    .on_press = Msg{ .auth_cycle = @intCast(index) },
+                    .style = .{ .radius = 4, .border = p.border_chip, .stroke_width = 1 },
+                    .semantics = .{ .role = .button, .label = ui.fmt("Change whether {s} may know who you are", .{e.url()}), .focusable = true },
+                }, .{
+                    hgap(ui, 5),
+                    ui.paragraph(.{ .style = .{ .foreground = p.text_muted_alt } }, &.{.{ .text = text, .monospace = true, .scale = mono_badge_scale }}),
+                    hgap(ui, 5),
+                }),
+            }) else ui.spacer(0),
             hgap(ui, 8),
             ui.el(.list_item, .{
                 .padding = 0.01,
@@ -17354,6 +17390,16 @@ fn relayListRow(ui: *AppUi, e: *const RelayEntry, index: usize, state: Conn) App
                 hgap(ui, 4),
             }),
         }),
+        // A relay that is connected and giving nothing is the state this line
+        // exists for: the dot is green, so without it the row reads as a relay
+        // with nothing to say.
+        if (authRowNote(index)) |note| ui.column(.{ .gap = 0 }, .{
+            vgap(ui, 3),
+            ui.row(.{ .gap = 0 }, .{
+                hgap(ui, 16),
+                ui.paragraph(.{ .wrap = true, .grow = 1, .style = .{ .foreground = p.status_warning_text } }, &.{.{ .text = note, .scale = mono_chip_scale }}),
+            }),
+        }) else ui.spacer(0),
         vgap(ui, 9),
     });
 }
@@ -24948,8 +24994,10 @@ fn feedContent(ui: *AppUi, model: *const Model) AppUi.Node {
         if (model.show_guest_strip()) guestBanner(ui, model) else ui.spacer(0),
         // Under the guest strip, because being signed out is the bigger fact.
         offlineBanner(ui, model),
-        // Under both. A newer version existing is the least urgent of the three
-        // and the only one the reader can put away.
+        // A relay is waiting on an answer only the reader can give.
+        relayAuthBanner(ui),
+        // Under all of them. A newer version existing is the least urgent and
+        // the only one the reader can put away.
         updateBanner(ui),
         // ONE header, not two. A place stacked its own banner on top of the
         // scope line, so the top of the room was the place's name over the
@@ -26766,6 +26814,88 @@ fn updateBanner(ui: *AppUi) AppUi.Node {
                                 ui.paragraph(
                                     .{ .style = .{ .foreground = p.text_muted } },
                                     &.{.{ .text = "Not now", .scale = meta_scale }},
+                                ),
+                            }),
+                        }),
+                        vgap(ui, 8),
+                    }),
+                    hgap(ui, 11),
+                }),
+            }),
+            hgap(ui, chrome_inset),
+        }),
+    });
+}
+
+/// The line asking whether a relay may know who the reader is.
+///
+/// Shown only for a relay that has refused something for want of AUTH, once per
+/// relay: the answer is kept, so it does not come back on the next launch or the
+/// next reconnect, and it can be changed from the relay's row. A relay that
+/// sends a challenge and gates nothing never raises it. It blocks nothing. The feed on every other relay carries on while it stands, and
+/// so does this relay's own socket; the subscriptions it refused wait for the
+/// answer.
+///
+/// The update banner's shape, because that is the register this app already
+/// uses for something worth saying that is not broken: a quiet panel, plain
+/// words, and the two verbs as underlined text rather than as buttons.
+fn relayAuthBanner(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    const asking = authAskingSummary() orelse return ui.spacer(0);
+    const index = asking.first;
+    const e = relayAt(index) orelse return ui.spacer(0);
+    const name = relayShortName(e.url());
+    const more = asking.count - 1;
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 8),
+        ui.row(.{ .gap = 0 }, .{
+            hgap(ui, chrome_inset),
+            ui.el(.panel, .{
+                .grow = 1,
+                .padding = 0.01,
+                .style = .{ .background = p.surface_menu, .border = p.border_menu, .radius = 8, .stroke_width = 1 },
+            }, .{
+                ui.row(.{ .cross = .center, .gap = 0 }, .{
+                    hgap(ui, 11),
+                    ui.column(.{ .gap = 0 }, .{
+                        vgap(ui, 8),
+                        ui.row(.{ .cross = .center, .gap = 0 }, .{
+                            ui.paragraph(
+                                .{ .wrap = true, .grow = 1, .style = .{ .foreground = p.text_body } },
+                                &.{.{
+                                    .text = if (more == 0)
+                                        ui.fmt("{s} asks you to identify yourself to it.", .{name})
+                                    else if (more == 1)
+                                        ui.fmt("{s} asks you to identify yourself to it. 1 more is waiting.", .{name})
+                                    else
+                                        ui.fmt("{s} asks you to identify yourself to it. {d} more are waiting.", .{ name, more }),
+                                    .scale = meta_scale,
+                                }},
+                            ),
+                            hgap(ui, 8),
+                            ui.row(.{
+                                .cross = .center,
+                                .gap = 0,
+                                .on_press = Msg{ .auth_allow = @intCast(index) },
+                                .style = .{ .quiet_hover = true },
+                                .semantics = .{ .role = .button, .label = ui.fmt("Let {s} know who you are", .{name}), .focusable = true },
+                            }, .{
+                                ui.paragraph(
+                                    .{ .style = .{ .foreground = p.text_primary } },
+                                    &.{.{ .text = "Allow", .weight = .medium, .underline = true, .scale = meta_scale }},
+                                ),
+                            }),
+                            hgap(ui, 12),
+                            ui.row(.{
+                                .cross = .center,
+                                .gap = 0,
+                                .on_press = Msg{ .auth_deny = @intCast(index) },
+                                .style = .{ .quiet_hover = true },
+                                .semantics = .{ .role = .button, .label = ui.fmt("Do not identify yourself to {s}", .{name}), .focusable = true },
+                            }, .{
+                                ui.paragraph(
+                                    .{ .style = .{ .foreground = p.text_muted } },
+                                    &.{.{ .text = "Don't allow", .scale = meta_scale }},
                                 ),
                             }),
                         }),
@@ -30678,6 +30808,8 @@ fn askPlaceAt(url_buf: [place_relay_cap]u8, url_len: usize, pubkey: [32]u8, iden
         switch (msg.value) {
             .event => |e| _ = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch {},
             .eose => break,
+            // A CLOSED ends this relay's part, and no EOSE is coming after it.
+            .closed => break,
             else => {},
         }
     }
@@ -31142,6 +31274,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // The same question for the built-in signer, which had no
                 // answer to it at all: a sign that failed simply ended.
                 if (g_signer_kind == .helper) scanHelperSign(model);
+                // A relay that asked who the reader is, and was told yes: get
+                // the answer signed. The reader thread sends it.
+                driveRelayAuth(fx);
                 // Health-check the signer daemon until the loopback IPC answers,
                 // then fire any queued key setup.
                 pollHelper(fx);
@@ -31381,6 +31516,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.profile_stage = .fetching;
             startOwnProfileFetch();
         },
+        .auth_allow => |i| authAnswer(i, true),
+        .auth_deny => |i| authAnswer(i, false),
+        .auth_cycle => |i| authCycle(i),
+        .helper_auth_signed => |response| handleHelperAuthSigned(response),
         .relay_cycle => |i| {
             cycleRelay(i);
             // The ack bits name slots, and this slot's direction just changed.
@@ -32725,6 +32864,27 @@ fn startOwnProfileFetch() void {
     thread.detach();
 }
 
+/// What a relay's message says about the question a socket was opened to ask.
+///
+/// Three outcomes and not two, because the two ways a question ends are not the
+/// same thing. An EOSE is the relay saying it looked and that is all of it.
+/// A CLOSED is the relay refusing to look, or ending the subscription, and no
+/// EOSE follows it. A loop that waits for "every relay answered" has to stop
+/// waiting on a refusal, and must not count it toward what it learned.
+const AskVerdict = enum { pending, answered, refused };
+
+fn askVerdict(msg: nostr.message.RelayMessage) AskVerdict {
+    return switch (msg) {
+        .eose => .answered,
+        .closed => .refused,
+        else => .pending,
+    };
+}
+
+pub fn askVerdictForTest(msg: nostr.message.RelayMessage) []const u8 {
+    return @tagName(askVerdict(msg));
+}
+
 fn ownProfileWorker(pk: [32]u8) void {
     var answered = false;
     defer {
@@ -32763,6 +32923,19 @@ fn ownProfileWorker(pk: [32]u8) void {
         while (seen < 32) : (seen += 1) {
             var msg = (relay.receive() catch break) orelse break;
             defer msg.deinit();
+            // Only an EOSE is an answer: "that is all I have". A CLOSED ends
+            // this relay's part of the question and says nothing about the
+            // account. `auth-required:` is the case that matters: the relay
+            // declined to look, and reading that as "no kind:0 here" is what
+            // lets an empty profile replace a real one.
+            switch (askVerdict(msg.value)) {
+                .answered => {
+                    answered = true;
+                    break;
+                },
+                .refused => break,
+                .pending => {},
+            }
             switch (msg.value) {
                 .event => |e| {
                     const result = plazaIngest(gpa, e.event, .{ .verify_with = signer }) catch continue;
@@ -32775,12 +32948,6 @@ fn ownProfileWorker(pk: [32]u8) void {
                     if (e.event.kind != 0) continue;
                     if (!std.mem.eql(u8, &e.event.pubkey, &pk)) continue;
                     answered = true;
-                },
-                // A relay that says "that is all I have" has answered, and so
-                // has one that closes the subscription: both are a reply.
-                .eose, .closed => {
-                    answered = true;
-                    break;
                 },
                 else => continue,
             }
@@ -36005,6 +36172,8 @@ fn fetchTopicWorker(topic_buf: [max_topic_bytes]u8, topic_len: u8, seq: u64) voi
                     if (result == .invalid) continue;
                 },
                 .eose => break,
+                // A CLOSED ends this relay's part, and no EOSE is coming after it.
+                .closed => break,
                 else => {},
             }
         }
@@ -36242,6 +36411,8 @@ fn sweepRelayListsWorker() void {
                         _ = g_indexed.fetchAdd(1, .monotonic);
                     },
                     .eose => break,
+                    // A CLOSED ends this relay's part, and no EOSE is coming after it.
+                    .closed => break,
                     else => {},
                 }
             }
@@ -36419,6 +36590,8 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
                     }
                 },
                 .eose => break,
+                // A CLOSED ends this relay's part, and no EOSE is coming after it.
+                .closed => break,
                 else => {},
             }
         }
@@ -36445,6 +36618,8 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
                         countEngagement(e.event, watch_ids[0..watch_len]);
                 },
                 .eose => break,
+                // A CLOSED ends this relay's part, and no EOSE is coming after it.
+                .closed => break,
                 else => {},
             }
         }
@@ -36839,6 +37014,17 @@ fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, client
                 break;
             }
         },
+        // A relay's NIP-42 challenge, signed. Never published and never stored:
+        // it goes to the one relay that asked, by way of the slot that is
+        // waiting for it, and `authDeliverSigned` checks it before it can.
+        .sign_auth => {
+            var parsed = nostr.event.fromJson(gpa, resp.value.result) catch {
+                authFailSigning(pending.half_index);
+                return;
+            };
+            defer parsed.deinit();
+            authDeliverSigned(gpa, signer, pending.half_index, parsed.value);
+        },
         .sign_event => {
             var parsed = nostr.event.fromJson(gpa, resp.value.result) catch return;
             defer parsed.deinit();
@@ -36954,6 +37140,11 @@ fn scanPendingRemote(model: *Model, fx_for_seal: *Effects) void {
             .nip44_encrypt => {
                 if (content) |c| gpa.free(c);
                 seal_failed = true;
+            },
+            // The relay's challenge goes unanswered and the row says so.
+            .sign_auth => {
+                if (content) |c| gpa.free(c);
+                authFailSigning(slot_half);
             },
         }
     }
@@ -37221,6 +37412,7 @@ fn startFeed(io: std.Io, environ: *const std.process.Environ.Map) void {
     // The reader's own list, or the one the app was born with. Read before the
     // threads start, so the first dial goes where they asked.
     loadRelays(io, environ);
+    loadAuthChoices(io, environ);
 
     // One ingest thread per SLOT, not per relay: a slot's thread outlives the
     // relay in it, so adding one later is a slot claim rather than a thread
@@ -38796,6 +38988,937 @@ fn ingestRelay(gpa: std.mem.Allocator, index: usize) void {
     }
 }
 
+// -- Being asked who you are (NIP-42) ----------------------------------------
+//
+// A relay may send `["AUTH", <challenge>]`. Answering means signing a kind:22242
+// event that names the relay and echoes the challenge, with the reader's key.
+// That tells the relay whose connection this is, so it is never done without the
+// reader's say: the first time a relay refuses us for want of it, a notice names
+// the relay and the reader chooses Allow or Don't allow. The answer is kept per account and relay, so a
+// second account on the same machine is asked for itself, and it can be changed
+// in the relay's row.
+//
+// Nothing here happens because a relay greeted us. Plenty of public relays send
+// a challenge on every connection and gate nothing, and answering those would
+// both ask the reader about relays that do not care and tell those relays who
+// they are. So a challenge is only kept, quietly, as the latest one that relay
+// sent. The reader's choice is consulted when the relay actually refuses
+// something with an `auth-required:` reason: allow answers and re-sends what was
+// refused, don't allow does nothing, and ask raises the notice. A relay that
+// never refuses anything is never asked about and never sent an AUTH.
+//
+// Three parties are involved and none of them may wait on another. The relay's
+// reader thread hears the AUTH and the CLOSED and later sends the reply. The UI
+// thread gets the signature, because the signer is reached through effects
+// (Notary's loopback door, or a bunker over NIP-46) and a person may take a
+// while to approve. So they meet in a per-relay slot under a spin lock, and each
+// only reads the slot or moves it one step. The reader never blocks on a
+// signature: it keeps reading, and the feed on every other relay is untouched.
+//
+// What is copied, and from where:
+//   - A challenge is stored and an `auth-required:` CLOSED reuses it, because a
+//     relay does not re-issue one (Amethyst RelayAuthenticator.kt:176-178,
+//     :231-237, :273-290).
+//   - Authentication is started by the refusal and not by the challenge: Jumble
+//     calls its authenticator only from the `auth-required` branch of a REQ's
+//     close handler (relay-subscription.ts:86-89), never when the challenge
+//     arrives.
+//   - The AUTH's OK is what re-sends the refused subscriptions, once, so a
+//     refusal cannot loop (Amethyst RelayAuthenticator.kt:293-305; Jumble
+//     relay-subscription.ts:86-100 restarts the REQ only after `authenticate`
+//     resolves and only if it has not authed before).
+//   - Whether to identify is the reader's decision per relay, asked once and
+//     remembered (Amethyst AuthCoordinator.kt:117-149, :193-226). A CLOSED
+//     that stays refused is a finished subscription, counted as settled and
+//     not as data (Jumble relay-subscription.ts:107-110).
+
+/// The longest challenge Plaza will sign. NIP-42 leaves it an arbitrary string;
+/// real relays send a few dozen bytes. One past this is not a challenge worth
+/// putting inside a signed event.
+const auth_challenge_cap = 256;
+/// The signed event as JSON: id, pubkey and sig (256 hex), the relay address
+/// (96), the challenge (256, doubled if every byte needs escaping), and the keys.
+const auth_event_cap = 1536;
+/// How long a signature may be out before it is given up on.
+const auth_sign_timeout_s: i64 = 30;
+/// A relay that refused a subscription for want of AUTH and then never sent a
+/// challenge is not going to. Past this the connection is dropped and re-dialed,
+/// which is what a refused feed did before AUTH was understood at all.
+const auth_gate_wait_ms: i64 = 20_000;
+
+/// What the reader has said about identifying themselves to one relay.
+pub const AuthChoice = enum(u8) { ask, allow, deny };
+
+const max_auth_choices = 128;
+/// `$HOME/.plaza/relay-auth`: one `allow <pubkey> <url>` or `deny <pubkey> <url>`
+/// per line, the pubkey in hex naming the account the answer was given for.
+/// Beside the relay list and the other local settings, and nowhere near a key.
+const auth_choices_file = "relay-auth";
+/// Written here first and renamed over the real one, so a crash mid-write
+/// leaves the old file whole rather than a last line cut short. A cut line
+/// could still be a relay address, just a different relay's.
+const auth_choices_tmp = "relay-auth.tmp";
+/// A line is the word, 64 hex, the address (96 at most) and three separators.
+const auth_choices_file_cap = max_auth_choices * 176 + 64;
+
+const AuthChoiceEntry = struct {
+    used: bool = false,
+    allow: bool = false,
+    /// Whose answer it is. Saying yes as one account says nothing about
+    /// another: the relay learns a different person.
+    account: [32]u8 = [_]u8{0} ** 32,
+    url_len: u8 = 0,
+    url_buf: [96]u8 = [_]u8{0} ** 96,
+
+    fn url(self: *const AuthChoiceEntry) []const u8 {
+        return self.url_buf[0..self.url_len];
+    }
+};
+
+/// Where one relay's challenge has got to.
+const AuthPhase = enum(u8) {
+    /// Nothing has been asked of us on this connection. A challenge may be held
+    /// in the slot, but no relay has refused anything for want of it yet.
+    idle,
+    /// Waiting for the reader to say yes or no.
+    asking,
+    /// Allowed. The UI tick has to get it signed.
+    want_sign,
+    /// A signer has the request.
+    signing,
+    /// `event` holds the signed reply, for the reader thread to send.
+    signed,
+    /// On the wire, waiting for the relay's OK.
+    sent,
+    /// The reader said no, now or earlier.
+    declined,
+    /// There is no key to identify with: a guest.
+    no_key,
+    /// The signer failed, or the relay refused the reply.
+    failed,
+    /// The relay accepted it.
+    done,
+};
+
+const AuthSlot = struct {
+    phase: AuthPhase = .idle,
+    /// The relay has refused something for want of AUTH. This is what turns a
+    /// held challenge into a question for the reader: a relay that merely greets
+    /// with a challenge is never asked about and never answered.
+    gated: bool = false,
+    deadline_s: i64 = 0,
+    /// The account the signer was asked to sign as.
+    signing_as: [32]u8 = [_]u8{0} ** 32,
+    challenge_len: u16 = 0,
+    challenge: [auth_challenge_cap]u8 = [_]u8{0} ** auth_challenge_cap,
+    event_len: u16 = 0,
+    event: [auth_event_cap]u8 = [_]u8{0} ** auth_event_cap,
+};
+
+var g_auth_lock = std.atomic.Value(bool).init(false);
+var g_auth_choices: [max_auth_choices]AuthChoiceEntry = @splat(.{});
+var g_auth_slots: [max_relays]AuthSlot = @splat(.{});
+
+fn authLock() void {
+    while (g_auth_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+fn authUnlock() void {
+    g_auth_lock.store(false, .release);
+}
+
+fn authChoiceLocked(account: [32]u8, url: []const u8) AuthChoice {
+    for (&g_auth_choices) |*e| {
+        if (!e.used or !std.mem.eql(u8, &e.account, &account)) continue;
+        if (relayUrlEql(e.url(), url)) return if (e.allow) .allow else .deny;
+    }
+    return .ask;
+}
+
+/// What `account` has said about `url`, or `.ask` when it has not.
+fn authChoiceOf(account: [32]u8, url: []const u8) AuthChoice {
+    authLock();
+    defer authUnlock();
+    return authChoiceLocked(account, url);
+}
+
+/// What the signed-in reader has said about `url`. `.ask` for a guest, who has
+/// nothing to say yes with.
+pub fn authChoiceFor(url: []const u8) AuthChoice {
+    const me = activePubkey() orelse return .ask;
+    return authChoiceOf(me, url);
+}
+
+/// Records `account`'s choice for `url`. `.ask` forgets it. False when there is
+/// no room, in which case nothing was recorded and the next challenge asks
+/// again, which is the safe way to fail.
+fn setAuthChoice(account: [32]u8, url: []const u8, choice: AuthChoice) bool {
+    const trimmed = std.mem.trimEnd(u8, url, "/");
+    if (trimmed.len == 0 or trimmed.len > 96) return false;
+    authLock();
+    defer authUnlock();
+    for (&g_auth_choices) |*e| {
+        if (!e.used or !std.mem.eql(u8, &e.account, &account)) continue;
+        if (!relayUrlEql(e.url(), trimmed)) continue;
+        if (choice == .ask) e.* = .{} else e.allow = choice == .allow;
+        return true;
+    }
+    if (choice == .ask) return true;
+    for (&g_auth_choices) |*e| {
+        if (e.used) continue;
+        e.* = .{ .used = true, .allow = choice == .allow, .account = account, .url_len = @intCast(trimmed.len) };
+        @memcpy(e.url_buf[0..trimmed.len], trimmed);
+        return true;
+    }
+    return false;
+}
+
+/// Reads the file's TEXT into the table. Split from the io so the format has a
+/// test, the same as the relay list's.
+fn applyAuthChoicesFile(raw: []const u8) void {
+    var lines = std.mem.tokenizeAny(u8, raw, "\r\n");
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+        var parts = std.mem.tokenizeScalar(u8, trimmed, ' ');
+        const word = parts.next() orelse continue;
+        // A line with no account on it (`allow <url>`, the shape before answers
+        // were per account) says nothing about whom it was said for, so it is
+        // skipped and that relay is asked about again.
+        const hex = parts.next() orelse continue;
+        const url = parts.next() orelse continue;
+        if (parts.next() != null) continue;
+        if (hex.len != 64) continue;
+        var account: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&account, hex) catch continue;
+        // Only an address this app would dial. A hand-edited line naming
+        // anything else is not a decision about a relay.
+        if (!isRelayUrl(url)) continue;
+        if (std.mem.eql(u8, word, "allow")) {
+            _ = setAuthChoice(account, url, .allow);
+        } else if (std.mem.eql(u8, word, "deny")) {
+            _ = setAuthChoice(account, url, .deny);
+        }
+    }
+}
+
+fn formatAuthChoicesFile(buf: []u8) ?[]const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    authLock();
+    defer authUnlock();
+    for (&g_auth_choices) |*e| {
+        if (!e.used) continue;
+        var hex: [64]u8 = undefined;
+        hexLower(&hex, e.account);
+        w.print("{s} {s} {s}\n", .{ if (e.allow) "allow" else "deny", hex[0..], e.url() }) catch return null;
+    }
+    return w.buffered();
+}
+
+fn loadAuthChoices(io: std.Io, environ: *const std.process.Environ.Map) void {
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    var buf: [auth_choices_file_cap]u8 = undefined;
+    const raw = dir.readFile(io, auth_choices_file, &buf) catch return;
+    applyAuthChoicesFile(raw);
+}
+
+fn saveAuthChoices() void {
+    const io = g_io orelse return;
+    const environ = g_environ orelse return;
+    var dir = plazaDir(io, environ) catch return;
+    defer dir.close(io);
+    var buf: [auth_choices_file_cap]u8 = undefined;
+    const text = formatAuthChoicesFile(&buf) orelse return;
+    dir.writeFile(io, .{
+        .sub_path = auth_choices_tmp,
+        .data = text,
+        .flags = .{ .permissions = secret_file_permissions },
+    }) catch return;
+    dir.rename(auth_choices_tmp, dir, auth_choices_file, io) catch {};
+}
+
+/// What to do about a challenge, given who the reader is and what they said.
+/// Called with the lock held; `account` is read before it is taken.
+fn authDecideLocked(account: ?[32]u8, url: []const u8) AuthPhase {
+    const me = account orelse return .no_key;
+    return switch (authChoiceLocked(me, url)) {
+        .allow => .want_sign,
+        .deny => .declined,
+        .ask => .asking,
+    };
+}
+
+/// A fresh connection on `index`, or one that has just ended: nothing from the
+/// last one applies to the next.
+fn authSlotReset(index: usize) void {
+    if (index >= max_relays) return;
+    authLock();
+    defer authUnlock();
+    g_auth_slots[index] = .{};
+}
+
+/// The relay on `index` sent a challenge. It is kept as the latest one and
+/// nothing else happens, unless the relay has already refused something for want
+/// of it, in which case this is the challenge that was being waited for.
+/// Returns where that leaves the slot.
+fn authSlotChallenge(index: usize, url: []const u8, challenge: []const u8) AuthPhase {
+    if (index >= max_relays) return .idle;
+    const me = activePubkey();
+    authLock();
+    defer authUnlock();
+    const s = &g_auth_slots[index];
+    s.event_len = 0;
+    if (challenge.len == 0 or challenge.len > auth_challenge_cap) {
+        s.challenge_len = 0;
+        if (s.gated) s.phase = .failed;
+        return s.phase;
+    }
+    @memcpy(s.challenge[0..challenge.len], challenge);
+    s.challenge_len = @intCast(challenge.len);
+    s.phase = if (s.gated) authDecideLocked(me, url) else .idle;
+    return s.phase;
+}
+
+/// Looks again at a challenge that is waiting on something the reader can
+/// change: signing in, switching account, or answering from the relay's row.
+///
+/// `pressed` is true when the reader has just answered. Only then does a failed
+/// exchange get another go: a signer that timed out while a person was away
+/// otherwise left the relay refusing for the life of the socket. Never on the
+/// reader thread's own wake, or a signer that keeps refusing would be asked
+/// again every thirty seconds.
+fn authSlotReevaluate(index: usize, url: []const u8, pressed: bool) void {
+    if (index >= max_relays) return;
+    const me = activePubkey();
+    authLock();
+    defer authUnlock();
+    const s = &g_auth_slots[index];
+    if (s.challenge_len == 0) return;
+    switch (s.phase) {
+        // `want_sign` is in the list so that changing the badge from identify to
+        // anonymous before the tick has asked for a signature takes effect. Once
+        // a signer has the request it is too late to recall, and the send checks
+        // the choice again.
+        .asking, .declined, .no_key, .want_sign => s.phase = authDecideLocked(me, url),
+        .failed => if (pressed) {
+            s.phase = authDecideLocked(me, url);
+        },
+        else => {},
+    }
+}
+
+/// A composed reply that may not go out after all: the reader said no while it
+/// was on its way, or is now a different account than the one it names. The
+/// slot is decided again for whoever is signed in now, so a yes from the new
+/// account gets its own signature and a no sends nothing.
+fn authSlotDiscardSigned(index: usize, url: []const u8) void {
+    if (index >= max_relays) return;
+    const me = activePubkey();
+    authLock();
+    defer authUnlock();
+    const s = &g_auth_slots[index];
+    s.event_len = 0;
+    s.phase = authDecideLocked(me, url);
+}
+
+/// The relay on `index` refused something for want of AUTH. This is the moment
+/// the reader's choice is consulted, with the challenge the relay last sent. With
+/// none held yet the slot waits for one.
+fn authSlotGate(index: usize, url: []const u8) void {
+    if (index >= max_relays) return;
+    const me = activePubkey();
+    authLock();
+    defer authUnlock();
+    const s = &g_auth_slots[index];
+    s.gated = true;
+    if (s.challenge_len != 0 and s.phase == .idle) s.phase = authDecideLocked(me, url);
+}
+
+fn authSlotPhase(index: usize) AuthPhase {
+    if (index >= max_relays) return .idle;
+    authLock();
+    defer authUnlock();
+    return g_auth_slots[index].phase;
+}
+
+fn authSlotGated(index: usize) bool {
+    if (index >= max_relays) return false;
+    authLock();
+    defer authUnlock();
+    return g_auth_slots[index].gated;
+}
+
+const AuthAsking = struct {
+    /// The first relay waiting on the reader's answer, the one the notice names.
+    first: usize,
+    /// How many are waiting, that one included.
+    count: usize,
+};
+
+/// Who is waiting on the reader, in ONE pass under the lock. The notice needs
+/// both halves, and taking them in two passes let a reader thread clear the
+/// slot in between: a first relay and a count of zero, and `count - 1` below
+/// zero.
+fn authAskingSummary() ?AuthAsking {
+    authLock();
+    defer authUnlock();
+    var out: ?AuthAsking = null;
+    for (&g_auth_slots, 0..) |*s, i| {
+        // A relay that has left the list cannot be asked about, and must not
+        // stand in front of one that still can.
+        if (s.phase != .asking or relayAt(i) == null) continue;
+        if (out) |*o| o.count += 1 else out = .{ .first = i, .count = 1 };
+    }
+    return out;
+}
+
+/// The first relay waiting on the reader's answer, for the notice.
+pub fn authAsking() ?usize {
+    const a = authAskingSummary() orelse return null;
+    return a.first;
+}
+
+/// How many relays are waiting on the reader, so the notice can say there are
+/// more behind the one it names.
+pub fn authAskingCount() usize {
+    const a = authAskingSummary() orelse return 0;
+    return a.count;
+}
+
+/// Claims an allowed challenge for signing. Returns its length, with the bytes
+/// in `out`, or null when this slot has nothing to sign.
+///
+/// Decided again here, for the account signed in at this moment. `want_sign`
+/// was decided for whoever was signed in when the challenge came or when the
+/// reader thread last woke, and a switch of account in between must not turn
+/// one account's yes into a signature from another.
+fn authBeginSigning(index: usize, url: []const u8, out: *[auth_challenge_cap]u8) ?usize {
+    if (index >= max_relays) return null;
+    const me = activePubkey();
+    authLock();
+    defer authUnlock();
+    const s = &g_auth_slots[index];
+    if (s.phase != .want_sign) return null;
+    s.phase = authDecideLocked(me, url);
+    if (s.phase != .want_sign) return null;
+    const n: usize = s.challenge_len;
+    @memcpy(out[0..n], s.challenge[0..n]);
+    s.signing_as = me.?;
+    s.phase = .signing;
+    s.deadline_s = nowSeconds() + auth_sign_timeout_s;
+    return n;
+}
+
+/// A signature that did not come: the signer refused, timed out, or answered
+/// with something unusable. Only moves a slot that is actually waiting on one.
+fn authFailSigning(index: usize) void {
+    if (index >= max_relays) return;
+    authLock();
+    defer authUnlock();
+    const s = &g_auth_slots[index];
+    if (s.phase == .signing) s.phase = .failed;
+}
+
+/// Retires signatures that have been out too long.
+fn authSweep(now_s: i64) void {
+    authLock();
+    defer authUnlock();
+    for (&g_auth_slots) |*s| {
+        if (s.phase == .signing and now_s >= s.deadline_s) s.phase = .failed;
+    }
+}
+
+/// A signed event has come back for `index`. It is checked against the slot
+/// before it can be sent: it must be a kind:22242 signed by the account that is
+/// signed in, naming this relay by the address it was dialed at and echoing the
+/// challenge it is currently holding. A signer is a separate program, and what
+/// it returns is data.
+fn authDeliverSigned(gpa: std.mem.Allocator, signer: nostr.keys.Signer, index: usize, ev: nostr.event.Event) void {
+    if (index >= max_relays) return;
+    var url_buf: [96]u8 = undefined;
+    const entry = relaySnapshot(index, &url_buf) orelse {
+        authFailSigning(index);
+        return;
+    };
+    const mine = activePubkey();
+    var relay_tag: ?[]const u8 = null;
+    var challenge_tag: ?[]const u8 = null;
+    for (ev.tags) |tag| {
+        if (tag.len < 2) continue;
+        if (relay_tag == null and std.mem.eql(u8, tag[0], "relay")) relay_tag = tag[1];
+        if (challenge_tag == null and std.mem.eql(u8, tag[0], "challenge")) challenge_tag = tag[1];
+    }
+    var sound = ev.kind == nostr.nip42.kind and ev.content.len == 0;
+    sound = sound and mine != null and std.mem.eql(u8, &ev.pubkey, &mine.?);
+    sound = sound and relay_tag != null and std.mem.eql(u8, relay_tag.?, entry.url) and challenge_tag != null;
+    if (sound) sound = nostr.event.verify(gpa, signer, ev) catch false;
+    const json: ?[]u8 = if (sound) (nostr.event.toJson(gpa, ev) catch null) else null;
+    defer if (json) |j| gpa.free(j);
+
+    authLock();
+    defer authUnlock();
+    const s = &g_auth_slots[index];
+    // Superseded: the connection ended or the slot moved on while this was out.
+    if (s.phase != .signing) return;
+    // The reader signed out, or in as someone else, while this was out. It
+    // answers for an account that is not here, so it is dropped, and the
+    // challenge is decided again for whoever is: their own yes is signed by
+    // them, and with no yes the notice asks. Failing it instead left the relay
+    // refusing the new account for the life of the socket.
+    const still_same = mine != null and std.mem.eql(u8, &mine.?, &s.signing_as);
+    if (!still_same) {
+        s.phase = authDecideLocked(mine, entry.url);
+        return;
+    }
+    const j = json orelse {
+        s.phase = .failed;
+        return;
+    };
+    if (j.len > auth_event_cap) {
+        s.phase = .failed;
+        return;
+    }
+    // The relay sent a newer challenge while the signer worked. This signature
+    // answers the old one, so it is thrown away and the new one is signed.
+    if (!std.mem.eql(u8, challenge_tag.?, s.challenge[0..s.challenge_len])) {
+        s.phase = .want_sign;
+        return;
+    }
+    @memcpy(s.event[0..j.len], j);
+    s.event_len = @intCast(j.len);
+    s.phase = .signed;
+}
+
+/// Takes the signed reply, for the reader thread to send.
+fn authTakeSigned(index: usize, out: *[auth_event_cap]u8) ?usize {
+    if (index >= max_relays) return null;
+    authLock();
+    defer authUnlock();
+    const s = &g_auth_slots[index];
+    if (s.phase != .signed) return null;
+    const n: usize = s.event_len;
+    @memcpy(out[0..n], s.event[0..n]);
+    s.phase = .sent;
+    return n;
+}
+
+/// The relay's OK for our reply.
+fn authOutcome(index: usize, accepted: bool) void {
+    if (index >= max_relays) return;
+    authLock();
+    defer authUnlock();
+    const s = &g_auth_slots[index];
+    if (s.phase == .sent) s.phase = if (accepted) .done else .failed;
+}
+
+/// Which subscriptions a relay refused for want of AUTH, so they can be asked
+/// again once it has been given.
+const OwedSubs = struct {
+    feed: bool = false,
+    inbox: bool = false,
+    engagement: bool = false,
+
+    fn mark(self: *OwedSubs, sub_id: []const u8) void {
+        if (std.mem.eql(u8, sub_id, "plaza-feed")) {
+            self.feed = true;
+        } else if (std.mem.eql(u8, sub_id, "plaza-inbox")) {
+            self.inbox = true;
+        } else if (std.mem.eql(u8, sub_id, "plaza-engagement")) {
+            self.engagement = true;
+        }
+    }
+
+    pub fn any(self: OwedSubs) bool {
+        return self.feed or self.inbox or self.engagement;
+    }
+};
+
+/// One connection's side of the exchange. Lives on the reader thread's stack.
+const AuthSession = struct {
+    index: usize,
+    owed: OwedSubs = .{},
+    /// The id of the reply we sent and are waiting on an OK for.
+    sent_id: ?[32]u8 = null,
+    /// A challenge arrived on this connection.
+    challenged: bool = false,
+    /// The relay accepted our reply. After this an `auth-required:` is final:
+    /// identifying again would not change the answer, and asking would loop.
+    authed: bool = false,
+    /// When the first auth-required CLOSED arrived, in the awake clock.
+    gated_at_ms: i64 = 0,
+    /// Whose connection it was when the reply went out. See `AuthPoll.redial`.
+    sent_gen: u32 = 0,
+};
+
+const AuthReaction = struct {
+    /// The message was about authentication and the caller is done with it.
+    handled: bool = false,
+    /// Subscriptions to ask again, because the relay has accepted us.
+    resend: OwedSubs = .{},
+};
+
+fn isAuthRequired(reason: []const u8) bool {
+    // NIP-01's machine-readable prefix, matched the way both reference clients
+    // match it: by the start of the reason, nothing after the colon.
+    return std.mem.startsWith(u8, reason, "auth-required");
+}
+
+/// What a relay's message means for authentication. Everything else comes back
+/// unhandled and goes on to the loop's own switch.
+fn authReact(sess: *AuthSession, url: []const u8, msg: nostr.message.RelayMessage, now_ms: i64) AuthReaction {
+    switch (msg) {
+        .auth => |a| {
+            // A new challenge starts the exchange over. Nothing sent for an
+            // earlier one counts for this one.
+            sess.sent_id = null;
+            sess.authed = false;
+            sess.challenged = true;
+            sess.gated_at_ms = 0;
+            const phase = authSlotChallenge(sess.index, url, a.challenge);
+            if (phase == .failed) std.debug.print("plaza: [{s}] sent a challenge that cannot be answered\n", .{url});
+            return .{ .handled = true };
+        },
+        .closed => |c| {
+            if (!isAuthRequired(c.message)) return .{};
+            if (sess.authed) return .{};
+            authGated(sess, url, now_ms);
+            sess.owed.mark(c.subscription_id);
+            return .{ .handled = true };
+        },
+        .ok => |o| {
+            const sent = sess.sent_id orelse return authRefusedEvent(sess, url, o, now_ms);
+            if (!std.mem.eql(u8, &o.event_id, &sent)) return authRefusedEvent(sess, url, o, now_ms);
+            sess.sent_id = null;
+            authOutcome(sess.index, o.accepted);
+            if (!o.accepted) {
+                std.debug.print("plaza: [{s}] refused our NIP-42 reply: {s}\n", .{ url, o.message });
+                return .{ .handled = true };
+            }
+            sess.authed = true;
+            const owed = sess.owed;
+            sess.owed = .{};
+            return .{ .handled = true, .resend = owed };
+        },
+        else => return .{},
+    }
+}
+
+/// The relay has refused something for want of AUTH: this is what makes it a
+/// question for the reader.
+fn authGated(sess: *AuthSession, url: []const u8, now_ms: i64) void {
+    authSlotGate(sess.index, url);
+    if (sess.gated_at_ms == 0) sess.gated_at_ms = now_ms;
+}
+
+/// An OK that said no to an event with an `auth-required:` reason. The same
+/// refusal as a CLOSED for a REQ. Nothing is owed back to the relay for it: the
+/// reader thread sends no events of its own, so there is nothing to re-send, but
+/// the relay has still said it wants to know who the reader is.
+fn authRefusedEvent(sess: *AuthSession, url: []const u8, o: anytype, now_ms: i64) AuthReaction {
+    if (o.accepted or !isAuthRequired(o.message) or sess.authed) return .{};
+    authGated(sess, url, now_ms);
+    return .{ .handled = true };
+}
+
+const AuthPoll = enum {
+    quiet,
+    /// Drop this connection and dial again. Either the relay refused a
+    /// subscription for want of a challenge it never sent, or the reader is no
+    /// longer the person this socket was identified as.
+    redial,
+};
+
+/// The reader's half of the exchange that is not a reaction to a message: send
+/// a signature that has arrived, and notice that the reader changed their mind
+/// or signed in. Called once a wake, so a quiet relay is served as well.
+fn authPoll(sess: *AuthSession, url: []const u8, relay: anytype, now_ms: i64, identity_gen: u32) AuthPoll {
+    // A relay remembers who a socket was identified as for as long as the socket
+    // lives. Signing out, or in as someone else, does not change that, so the
+    // only way to stop being known to the relay as the previous account is to
+    // leave the connection.
+    if (sess.authed and identity_gen != sess.sent_gen) return .redial;
+    authSlotReevaluate(sess.index, url, false);
+    var buf: [auth_event_cap]u8 = undefined;
+    if (authTakeSigned(sess.index, &buf)) |n| {
+        const gpa = std.heap.page_allocator;
+        if (nostr.event.fromJson(gpa, buf[0..n])) |parsed_const| {
+            var parsed = parsed_const;
+            defer parsed.deinit();
+            // Checked again here, at the last moment before it leaves: the
+            // reader can press "anonymous" while a bunker is still waiting for a
+            // person, or switch account, and a reply signed as the previous one
+            // would identify this socket as somebody who is no longer here.
+            // Only a yes from the account the reply names lets it go.
+            const me = activePubkey();
+            const still_mine = me != null and std.mem.eql(u8, &me.?, &parsed.value.pubkey);
+            if (!still_mine or authChoiceOf(parsed.value.pubkey, url) != .allow) {
+                authSlotDiscardSigned(sess.index, url);
+                return .quiet;
+            }
+            if (relay.authenticate(parsed.value)) |_| {
+                sess.sent_id = parsed.value.id;
+                sess.sent_gen = identity_gen;
+            } else |_| {
+                authOutcome(sess.index, false);
+            }
+        } else |_| {
+            authOutcome(sess.index, false);
+        }
+    }
+    if (sess.gated_at_ms != 0 and !sess.challenged and now_ms - sess.gated_at_ms > auth_gate_wait_ms) return .redial;
+    return .quiet;
+}
+
+// The UI half. Everything below runs on the UI thread, which is the only one
+// that may reach a signer.
+
+/// One signature at a time through Notary's door, as with a note. A bunker has
+/// a table of its own.
+var g_helper_auth_active = false;
+var g_helper_auth_index: usize = 0;
+const helper_auth_key: u64 = 45;
+
+fn authSignerReady() bool {
+    return switch (g_signer_kind) {
+        .helper => !g_helper_auth_active and (g_helper_port != 0 or builtin.is_test),
+        .remote => true,
+    };
+}
+
+/// Builds the unsigned kind:22242 for `url` and `challenge` and asks the active
+/// signer for a signature. False when nothing could be asked.
+fn requestAuthSign(fx: *Effects, index: usize, url: []const u8, challenge: []const u8) bool {
+    const pk = activePubkey() orelse return false;
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const created = nowSeconds();
+    const relay_tag = a.dupe([]const u8, &.{ "relay", url }) catch return false;
+    const challenge_tag = a.dupe([]const u8, &.{ "challenge", challenge }) catch return false;
+    const tags = a.dupe(nostr.event.Tag, &.{ relay_tag, challenge_tag }) catch return false;
+    const id = nostr.event.computeId(a, pk, created, nostr.nip42.kind, tags, "") catch return false;
+    const unsigned = nostr.event.Event{
+        .id = id,
+        .pubkey = pk,
+        .created_at = created,
+        .kind = nostr.nip42.kind,
+        .tags = tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    const unsigned_json = nostr.event.toJson(a, unsigned) catch return false;
+    switch (g_signer_kind) {
+        .helper => {
+            const body = (nostr.signer_ipc.SignEvent{ .event = unsigned_json }).toJson(a) catch return false;
+            g_helper_auth_active = true;
+            g_helper_auth_index = index;
+            // A test cannot drive the loopback, so a stand-in keyholder answers
+            // the way the real one does and the response handler runs for real.
+            if (builtin.is_test) {
+                if (!g_test_signer_silent) answerHelperAuthForTest(a, unsigned_json);
+                return true;
+            }
+            helperFetch(fx, helper_auth_key, "/sign", body, Effects.responseMsg(.helper_auth_signed));
+            return true;
+        },
+        .remote => {
+            var idbuf: [24]u8 = undefined;
+            const req_id = newRequestId(&idbuf) orelse return false;
+            // Tracked before it is sent: the answer can land on the listener
+            // thread the instant the send does.
+            if (!registerPending(req_id, .sign_auth, null, false, .none, @intCast(index), no_half_id, .{})) return false;
+            const params = [_][]const u8{unsigned_json};
+            sendRequest(std.heap.page_allocator, .{ .id = req_id, .method = "sign_event", .params = &params });
+            return true;
+        },
+    }
+}
+
+fn answerHelperAuthForTest(a: std.mem.Allocator, unsigned_json: []const u8) void {
+    const secret = g_test_secret orelse return;
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(secret) catch return;
+    var parsed = nostr.event.fromJson(a, unsigned_json) catch return;
+    defer parsed.deinit();
+    const ev = parsed.value;
+    const signed = nostr.event.create(a, signer, kp, ev.created_at, ev.kind, ev.tags, ev.content, null) catch return;
+    const signed_json = nostr.event.toJson(a, signed) catch return;
+    const body = (nostr.signer_ipc.SignEvent{ .event = signed_json }).toJson(a) catch return;
+    handleHelperAuthSigned(.{ .key = helper_auth_key, .outcome = .ok, .status = 200, .body = body });
+}
+
+fn handleHelperAuthSigned(response: native_sdk.EffectResponse) void {
+    const index = g_helper_auth_index;
+    g_helper_auth_active = false;
+    if (response.outcome != .ok or response.status != 200) {
+        authFailSigning(index);
+        return;
+    }
+    const gpa = std.heap.page_allocator;
+    var wrapped = nostr.signer_ipc.parse(nostr.signer_ipc.SignEvent, gpa, response.body) catch {
+        authFailSigning(index);
+        return;
+    };
+    defer wrapped.deinit();
+    var parsed = nostr.event.fromJson(gpa, wrapped.value.event) catch {
+        authFailSigning(index);
+        return;
+    };
+    defer parsed.deinit();
+    var verifier = nostr.keys.Signer.init();
+    defer verifier.deinit();
+    authDeliverSigned(gpa, verifier, index, parsed.value);
+}
+
+/// The tick's share: retire stale signatures, and get the allowed challenges
+/// signed.
+fn driveRelayAuth(fx: *Effects) void {
+    authSweep(nowSeconds());
+    for (0..max_relays) |i| {
+        if (authSlotPhase(i) != .want_sign) continue;
+        if (!authSignerReady()) return;
+        var url_buf: [96]u8 = undefined;
+        const entry = relaySnapshot(i, &url_buf) orelse {
+            authSlotReset(i);
+            continue;
+        };
+        var challenge: [auth_challenge_cap]u8 = undefined;
+        const n = authBeginSigning(i, entry.url, &challenge) orelse continue;
+        if (!requestAuthSign(fx, i, entry.url, challenge[0..n])) {
+            if (g_signer_kind == .helper) g_helper_auth_active = false;
+            authFailSigning(i);
+        }
+    }
+}
+
+/// The reader's answer to the notice.
+fn authAnswer(index: usize, allow: bool) void {
+    const me = activePubkey() orelse return;
+    var url_buf: [96]u8 = undefined;
+    const entry = relaySnapshot(index, &url_buf) orelse return;
+    _ = setAuthChoice(me, entry.url, if (allow) .allow else .deny);
+    saveAuthChoices();
+    authSlotReevaluate(index, entry.url, true);
+}
+
+/// The relay row's badge: ask first, then identify, then anonymous.
+fn authCycle(index: usize) void {
+    const me = activePubkey() orelse return;
+    var url_buf: [96]u8 = undefined;
+    const entry = relaySnapshot(index, &url_buf) orelse return;
+    const next: AuthChoice = switch (authChoiceOf(me, entry.url)) {
+        .ask => .allow,
+        .allow => .deny,
+        .deny => .ask,
+    };
+    _ = setAuthChoice(me, entry.url, next);
+    saveAuthChoices();
+    authSlotReevaluate(index, entry.url, true);
+}
+
+/// What the badge on a relay row says, or null when there is nothing to say
+/// yet: no choice made and no refusal for want of AUTH. Null for a guest too, who has no
+/// identity to give and so nothing for the badge to change.
+fn authBadgeText(index: usize, url: []const u8) ?[]const u8 {
+    if (activePubkey() == null) return null;
+    const choice = authChoiceFor(url);
+    if (choice == .ask and authSlotPhase(index) == .idle) return null;
+    return switch (choice) {
+        .ask => "ask first",
+        .allow => "identify",
+        .deny => "anonymous",
+    };
+}
+
+/// Why a relay is not giving this reader what they asked for, in the row, when
+/// the reason is authentication. Null for a relay that has not refused.
+fn authRowNote(index: usize) ?[]const u8 {
+    if (!authSlotGated(index)) return null;
+    return switch (authSlotPhase(index)) {
+        .asking => "Wants to know who you are. Waiting for your answer.",
+        .want_sign, .signing, .signed, .sent => "Identifying you to it.",
+        .declined => "Wants to know who you are. You chose not to tell it.",
+        .no_key => "Wants to know who you are. Sign in to answer it.",
+        .failed => "Wants to know who you are, and would not accept the answer.",
+        .idle, .done => null,
+    };
+}
+
+pub fn resetRelayAuthForTest() void {
+    authLock();
+    g_auth_choices = @splat(.{});
+    g_auth_slots = @splat(.{});
+    authUnlock();
+    g_helper_auth_active = false;
+    g_helper_auth_index = 0;
+}
+
+pub fn authChoiceForTest(url: []const u8) AuthChoice {
+    return authChoiceFor(url);
+}
+pub fn authChoiceOfForTest(account: [32]u8, url: []const u8) AuthChoice {
+    return authChoiceOf(account, url);
+}
+pub fn setAuthChoiceForTest(account: [32]u8, url: []const u8, choice: AuthChoice) bool {
+    return setAuthChoice(account, url, choice);
+}
+pub fn authFileForTest(buf: []u8) ?[]const u8 {
+    return formatAuthChoicesFile(buf);
+}
+pub fn applyAuthFileForTest(raw: []const u8) void {
+    applyAuthChoicesFile(raw);
+}
+pub fn authPhaseNameForTest(index: usize) []const u8 {
+    return @tagName(authSlotPhase(index));
+}
+pub fn authRowNoteForTest(index: usize) ?[]const u8 {
+    return authRowNote(index);
+}
+pub fn authBadgeTextForTest(index: usize, url: []const u8) ?[]const u8 {
+    return authBadgeText(index, url);
+}
+pub fn driveRelayAuthForTest(fx: *Effects) void {
+    driveRelayAuth(fx);
+}
+pub fn authAnswerForTest(index: usize, allow: bool) void {
+    authAnswer(index, allow);
+}
+pub fn authCycleForTest(index: usize) void {
+    authCycle(index);
+}
+pub fn authSweepForTest(now_s: i64) void {
+    authSweep(now_s);
+}
+pub fn authHelperBusyForTest() bool {
+    return g_helper_auth_active;
+}
+/// The keyholder's answer to the request that was out has arrived and been
+/// dropped, as `handleHelperAuthSigned` does, leaving it free for the next.
+pub fn authHelperFreeForTest() void {
+    g_helper_auth_active = false;
+}
+/// The connection on `index` has ended.
+pub fn authSlotResetForTest(index: usize) void {
+    authSlotReset(index);
+}
+pub fn authDeliverSignedForTest(index: usize, ev: nostr.event.Event) void {
+    var verifier = nostr.keys.Signer.init();
+    defer verifier.deinit();
+    authDeliverSigned(std.heap.page_allocator, verifier, index, ev);
+}
+
+/// The reader thread's reaction, driven by a test with a stand-in relay.
+pub const AuthSessionForTest = AuthSession;
+pub const AuthReactionForTest = AuthReaction;
+pub fn authReactForTest(sess: *AuthSession, url: []const u8, msg: nostr.message.RelayMessage, now_ms: i64) AuthReaction {
+    return authReact(sess, url, msg, now_ms);
+}
+pub fn authPollForTest(sess: *AuthSession, url: []const u8, relay: anytype, now_ms: i64) []const u8 {
+    return @tagName(authPoll(sess, url, relay, now_ms, identityGeneration()));
+}
+pub const auth_gate_wait_ms_for_test = auth_gate_wait_ms;
+
 /// Dials relay `index`, subscribes for recent kind:1, and ingests each event
 /// into the shared store until the connection closes.
 fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, index: usize) !void {
@@ -38813,6 +39936,13 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
     offerLiveRelay(index, relay);
     defer offerLiveRelay(index, null);
     setRelayStatus(index, .connected);
+
+    // NIP-42, for this connection. The slot is wiped on the way in and on the
+    // way out: a challenge belongs to the socket that heard it, and a notice
+    // left standing for a socket that is gone would be asking about nothing.
+    var auth = AuthSession{ .index = index };
+    authSlotReset(index);
+    defer authSlotReset(index);
 
     // Follow-scoped: the starter pack's recent notes for the feed, plus their
     // kind:0 metadata (and the user's own) so the feed can show real names and
@@ -38957,6 +40087,14 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
             inbox_gen = identityGeneration();
             subscribeInbox(relay);
         }
+        // A signature that has come back is sent from here and nowhere else:
+        // this thread owns the socket's conversation, and the UI thread that got
+        // the signature never touches it. A relay set write-only is not asked
+        // anything, so it has nothing an identity would unlock.
+        if (reads) {
+            const awake_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+            if (authPoll(&auth, url, relay, awake_ms, identityGeneration()) == .redial) return error.FeedSubscriptionClosed;
+        }
         // With a deadline, so the checks above actually run on a quiet relay.
         //
         // Without one this loop only advances when the relay speaks, so a relay
@@ -38983,6 +40121,34 @@ fn ingestOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signer, ind
         // not exist, which says nothing about who this reader follows or reads,
         // and its answer is the latency shown beside a relay they do use.
         const now_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        // A challenge, a refusal for want of one, or the verdict on our reply.
+        // None of these is the end of a subscription: a CLOSED for auth is the
+        // relay saying "not yet", and the feed it refused is asked again once
+        // the relay has accepted us. Without this arm the refused feed ended the
+        // connection and the reconnect ladder went round again, forever, without
+        // ever answering the challenge that was the reason.
+        if (reads) {
+            const react = authReact(&auth, url, msg.value, now_ms);
+            if (react.handled) {
+                switch (msg.value) {
+                    .closed => |c| {
+                        std.debug.print("plaza: [{s}] closed {s}: {s}\n", .{ url, c.subscription_id, c.message });
+                        if (std.mem.eql(u8, c.subscription_id, probe_sub)) probe_at = 0;
+                    },
+                    else => {},
+                }
+                // Moving the generation is how this loop already re-asks a
+                // subscription, so the refused ones are re-sent by the same
+                // code that built them rather than by a copy of it.
+                if (react.resend.feed) subscribed_gen -%= 1;
+                if (react.resend.inbox) inbox_gen -%= 1;
+                if (react.resend.engagement) {
+                    engagement_watching = 0;
+                    engagement_at = 0;
+                }
+                continue;
+            }
+        }
         if (probe_at == 0 and (probed_at == 0 or now_ms - probed_at > probe_interval_ms)) {
             const probe_filters = probeFilters();
             if (relay.subscribe(probe_sub, &probe_filters)) |_| {
