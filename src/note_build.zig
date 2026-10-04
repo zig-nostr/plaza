@@ -114,10 +114,7 @@ pub fn noteFrom(ev: nostr.event.Event, now_s: i64) Note {
         // belongs in a row. Without a title there is nothing honest to show,
         // so the card falls to the unsupported chip rather than to the body.
         .article => {
-            if (titleOf(ev)) |title| {
-                @memcpy(note.content_buf[0..title.len], title);
-                note.content_len = @intCast(title.len);
-            }
+            if (titleInto(&note.content_buf, ev)) |len| note.content_len = @intCast(len);
             // The `image` tag is the article's cover, and the one picture the
             // note carries, so the reader draws it through the same path every
             // other picture takes (its slot, its disk cache, its placeholder).
@@ -251,11 +248,10 @@ pub fn kindRender(kind: u16) KindRender {
     };
 }
 
-/// An event's `title` tag, clipped the way a client name is.
-///
-/// Modelled line for line on `clientOf`, including the truncate-rather-than-
-/// refuse rule and the control-character check: both read one short tag off a
-/// stranger's event and put it in a fixed row.
+/// An event's `title` tag, trimmed, or null when it is empty or carries a
+/// control character. The control-character check is `clientOf`'s: both read
+/// one short tag off a stranger's event and put it in a fixed row. How much of
+/// it a card shows is `titleInto`'s business.
 pub fn titleOf(ev: nostr.event.Event) ?[]const u8 {
     for (ev.tags) |tag| {
         if (tag.len < 2 or !std.mem.eql(u8, tag[0], "title")) continue;
@@ -264,9 +260,33 @@ pub fn titleOf(ev: nostr.event.Event) ?[]const u8 {
         for (title) |c| {
             if (c < 0x20 or c == 0x7f) return null;
         }
-        return clipToChars(title, article_title_chars, article_title_bytes);
+        return title;
     }
     return null;
+}
+
+/// The title as a card shows it, copied into `out`: whole when it fits the
+/// card's budget, and otherwise cut at the last word that fits with an
+/// ellipsis after it. A title stopped mid-word with nothing to say so ("what it
+/// costs to bui") reads as the whole title, misspelt.
+pub fn titleInto(out: []u8, ev: nostr.event.Event) ?usize {
+    const title = titleOf(ev) orelse return null;
+    const ellipsis = "\u{2026}";
+    const clipped = clipToChars(title, article_title_chars, @min(article_title_bytes, out.len));
+    if (clipped.len == title.len) {
+        @memcpy(out[0..clipped.len], clipped);
+        return clipped.len;
+    }
+    var cut = clipToChars(title, article_title_chars - 1, @min(article_title_bytes, out.len) - ellipsis.len);
+    // Back to a word boundary, unless that would throw away most of it: a
+    // title that is one enormous word keeps what fits.
+    if (std.mem.lastIndexOfScalar(u8, cut, ' ')) |space| {
+        if (space >= cut.len / 2) cut = cut[0..space];
+    }
+    cut = std.mem.trimEnd(u8, cut, " ,;:-");
+    @memcpy(out[0..cut.len], cut);
+    @memcpy(out[cut.len..][0..ellipsis.len], ellipsis);
+    return cut.len + ellipsis.len;
 }
 
 /// A title is one line in a card, so it is capped like every other such string

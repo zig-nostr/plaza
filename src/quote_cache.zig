@@ -40,6 +40,7 @@ const plazaIngestFrom = main.plazaIngestFrom;
 const relayFetchAllowed = main.relayFetchAllowed;
 const releaseOneShot = main.releaseOneShot;
 const renderContent = main.renderContent;
+const titleInto = main.titleInto;
 const titleOf = main.titleOf;
 const urlHost = main.urlHost;
 const utf8SafeLen = main.utf8SafeLen;
@@ -323,11 +324,7 @@ pub fn refreshQuotes(store: *nostr.store.Store) void {
                 q.text_len = @intCast(keep);
             },
             .article => {
-                if (titleOf(se.event)) |title| {
-                    const keep = @min(title.len, q.text_buf.len);
-                    @memcpy(q.text_buf[0..keep], title[0..keep]);
-                    q.text_len = @intCast(keep);
-                }
+                if (titleInto(&q.text_buf, se.event)) |len| q.text_len = @intCast(len);
             },
             // Nothing to bake. The card draws the chip instead, which says
             // what this is rather than showing a slab of something nobody can

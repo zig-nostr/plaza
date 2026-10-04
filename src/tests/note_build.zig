@@ -980,3 +980,34 @@ test "the filter for older notes asks for exactly the notes before the oldest on
     // Comments too: the page shows them, so paging has to be able to reach them.
     try testing.expectEqualSlices(u16, &.{ 1, main.comment_kind }, f.kinds.?);
 }
+
+test "an article title too long for a card is cut at a word and says so" {
+    const long = "Local-first, in practice: why a feed should never wait for the network, and what it costs to build one that does not";
+    const tags = [_]nostr.event.Tag{&.{ "title", long }};
+    var ev = warnedEvent(0x31, "", &tags);
+    ev.kind = 30023;
+    var buf: [320]u8 = undefined;
+    const n = main.titleInto(&buf, ev) orelse return error.NoTitle;
+    const shown = buf[0..n];
+    try testing.expect(std.mem.endsWith(u8, shown, "\u{2026}"));
+    const words = shown[0 .. shown.len - "\u{2026}".len];
+    // Every word kept is a whole word of the title.
+    try testing.expect(std.mem.startsWith(u8, long, words));
+    try testing.expectEqual(@as(u8, ' '), long[words.len]);
+    try testing.expect(std.unicode.utf8CountCodepoints(shown) catch 0 <= 96);
+
+    // A title that fits is left exactly as written.
+    const short = "Local-first, in practice";
+    const tags2 = [_]nostr.event.Tag{&.{ "title", short }};
+    const ev2 = warnedEvent(0x32, "", &tags2);
+    const m = main.titleInto(&buf, ev2) orelse return error.NoTitle;
+    try testing.expectEqualStrings(short, buf[0..m]);
+
+    // One enormous word keeps what fits rather than collapsing to nothing.
+    const word = "a" ** 150;
+    const tags3 = [_]nostr.event.Tag{&.{ "title", word }};
+    const ev3 = warnedEvent(0x33, "", &tags3);
+    const k = main.titleInto(&buf, ev3) orelse return error.NoTitle;
+    try testing.expect(k > 90);
+    try testing.expect(std.mem.endsWith(u8, buf[0..k], "\u{2026}"));
+}
