@@ -24983,6 +24983,50 @@ test "relay hints are gated, deduped and capped before anything dials them" {
     try testing.expect(none.isEmpty());
 }
 
+test "a quoted nevent's relay hints never send this machine to its own network" {
+    // An `nevent1` in a note can name any relay, and its hints are dialled with
+    // nobody pressing anything: the quote card asks as the note scrolls into
+    // view. A hostile note naming a loopback or a LAN address would make every
+    // reader's machine knock on its own network. The cleartext forms were already
+    // refused for not being wss; the wss forms of the same places got through.
+    const private = [_][]const u8{
+        "ws://127.0.0.1",         "ws://localhost",        "ws://192.168.1.20",    "ws://10.0.0.7",
+        "wss://127.0.0.1",        "wss://localhost",       "wss://192.168.1.20",   "wss://10.0.0.7",
+        "wss://[::1]",            "wss://127.0.0.1:7777/", "wss://localhost:4848", "wss://172.16.0.9",
+        "wss://relay.home.local", "wss://router.lan",
+    };
+    const public = "wss://relay.public.example";
+
+    // One at a time, so a refusal is not just the cap of two filling up.
+    for (private) |url| {
+        var h: main.RelayHints = .{};
+        h.fill(&.{url});
+        if (!h.isEmpty()) {
+            std.debug.print("\nkept a private relay hint: {s}\n", .{url});
+            return error.PrivateHintKept;
+        }
+    }
+
+    // And all together ahead of a public one: none of them takes one of the
+    // two slots, so the relay that can actually answer still gets dialled.
+    var mixed: [private.len + 1][]const u8 = undefined;
+    for (private, 0..) |url, i| mixed[i] = url;
+    mixed[private.len] = public;
+    var h: main.RelayHints = .{};
+    h.fill(&mixed);
+    try testing.expectEqual(@as(u8, 1), h.count);
+    try testing.expectEqualStrings(public, h.at(0));
+
+    // The same through the quote cache, which is what the card's fetch dials.
+    main.resetQuotesForTest();
+    defer main.resetQuotesForTest();
+    const id = [_]u8{0x5d} ** 32;
+    main.wantQuoteHintedForTest(id, &mixed);
+    const kept = main.quoteHintsForTest(id);
+    try testing.expectEqual(@as(u8, 1), kept.count);
+    try testing.expectEqualStrings(public, kept.at(0));
+}
+
 test "an address Plaza cannot read keeps the field open with what was typed in it" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

@@ -3253,8 +3253,13 @@ pub fn isSafeRelayUrl(url: []const u8) bool {
 /// throwaway socket to a relay this reader does not otherwise talk to, and an
 /// `nevent` can name as many as its author felt like.
 ///
-/// Every hint is gated through `isSafeRelayUrl` on the way IN, so nothing
-/// downstream has to remember to check a string that came off the wire.
+/// Every hint is gated through `isPublicRelayUrl` on the way IN, so nothing
+/// downstream has to remember to check a string that came off the wire. Public
+/// and not only well formed: these are dialled with nobody pressing anything (a
+/// quote card asks as its note scrolls into view), so a note naming a loopback
+/// or a LAN relay would send every reader's machine knocking on its own network.
+/// Gated here rather than at the dial alone, too, so such a hint never takes one
+/// of the two slots from a relay that could answer.
 pub const RelayHints = struct {
     pub const cap = 2;
 
@@ -3272,7 +3277,7 @@ pub const RelayHints = struct {
         self.tried = false;
         for (hints) |h| {
             if (self.count >= cap) break;
-            if (!isSafeRelayUrl(h)) continue;
+            if (!isPublicRelayUrl(h)) continue;
             // Never a duplicate: two mentions of the same relay would spend two
             // of the two slots on one socket.
             var seen = false;
@@ -7307,6 +7312,7 @@ fn askProfileHints() void {
         if (spawned + w.hints.count > quote_hint_dials_per_pass) break;
         w.hints.tried = true;
         for (0..w.hints.count) |i| {
+            if (!isPublicRelayUrl(w.hints.at(@intCast(i)))) continue;
             var url_buf: [place_relay_cap]u8 = undefined;
             const len = copyBounded(&url_buf, w.hints.at(@intCast(i)));
             const t = std.Thread.spawn(.{}, askProfileAt, .{ url_buf, len, w.pubkey }) catch continue;
@@ -9032,6 +9038,9 @@ fn askQuoteHints() void {
         if (spawned + q.hints.count > quote_hint_dials_per_pass) break;
         q.hints.tried = true;
         for (0..q.hints.count) |i| {
+            // `fill` already refused these; checked again where the socket is
+            // opened, for the reason the gate above gives.
+            if (!isPublicRelayUrl(q.hints.at(@intCast(i)))) continue;
             var url_buf: [place_relay_cap]u8 = undefined;
             const len = copyBounded(&url_buf, q.hints.at(@intCast(i)));
             const t = std.Thread.spawn(.{}, askQuoteAt, .{ url_buf, len, q.id }) catch continue;
@@ -30987,6 +30996,19 @@ pub fn profileHintCountForTest(pubkey: [32]u8) ?u8 {
 
 pub fn wantQuoteForTest(id: [32]u8) void {
     wantQuote(id);
+}
+
+/// Wants a quoted event the way an `nevent1` naming relays does.
+pub fn wantQuoteHintedForTest(id: [32]u8, hints: []const []const u8) void {
+    wantQuoteHinted(id, hints);
+}
+
+/// The relays a quote's fetch would dial, empty when it is not cached.
+pub fn quoteHintsForTest(id: [32]u8) RelayHints {
+    for (&g_quotes) |*q| {
+        if (q.used and std.mem.eql(u8, &q.id, &id)) return q.hints;
+    }
+    return .{};
 }
 
 /// The real fill path, over a real store: what a quote card knows about the
