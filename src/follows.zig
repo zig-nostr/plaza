@@ -9,6 +9,7 @@ const main = @import("main.zig");
 const own_lists = @import("own_lists.zig");
 const relay_list = @import("relay_list.zig");
 const routing = @import("routing.zig");
+const mutes = @import("mutes.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -869,7 +870,7 @@ pub fn applyUndo(model: *Model) void {
             var next: [max_mutes][32]u8 = undefined;
             var n: usize = 0;
             lockMutes();
-            for (main.g_mutes[0..main.g_mute_count]) |m| {
+            for (mutes.g_mutes[0..mutes.g_mute_count]) |m| {
                 if (p.added and std.mem.eql(u8, &m, &p.pubkey)) continue;
                 if (n >= next.len) break;
                 next[n] = m;
