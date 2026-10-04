@@ -32,7 +32,17 @@ client.
 > A video in a note is drawn as a video rather than as a web page, though it is
 > not played in place yet.
 >
-> A picture can go into a note, or be set as an avatar or a banner. It is uploaded to a Blossom media server: the first in your published server list that takes it, or one of two built in when you have none. A card names the server and waits for a press before anything is sent, and the location and camera details in the file are removed first. Settings lists the servers and edits the list.
+> A picture can go into a note, or be set as an avatar or a banner. It is uploaded to a Blossom media server: the first in your published server list that takes it, or one of two built in when you have none. A card names the server and waits for a press before anything is sent, and the location and camera details in the file are removed first, comments and XMP included for a GIF. Settings lists the servers and edits the list.
+>
+> A note whose author marked it sensitive (NIP-36) is covered by one line, the reason when there is one and a Show press that uncovers that note for the session. Its pictures, its link preview and the picture of any note it quotes are not fetched until you press Show, and an article with a warning is covered the same way. "Show sensitive notes without a warning" in Settings turns the covering off, and the composer can add a warning with an optional reason to a note you write.
+>
+> A long-form article (NIP-23) opens in a reader of its own: the byline, title, summary and cover, then the body. An `naddr` for an article, in a note, in a quote or in the search field, opens it. A draft is not opened, and Plaza reads articles without writing them.
+>
+> A relay that asks who you are (NIP-42) gets an answer only after it has refused something for want of one, and only if you have said yes. Allow or Don't allow is asked once per relay for each account. Once a relay has asked or been answered, its row in Settings carries a badge (ask first, identify or anonymous), and pressing the badge changes the choice. A relay that only sends a challenge and gates nothing is never asked about.
+>
+> A quote card draws the picture of the note it quotes. The rows and controls that answer a click can be reached with Tab and pressed with Return or Space.
+>
+> Pictures, avatars, banners and a place's logo are fetched only from a public address, never from a host on your own network. With the media proxy on, they are asked of the proxy, and go direct only when it refuses a host and "Ask the host when the proxy refuses" is on. A relay address taken from somebody else's note, relay list or place is dialled only when it is public.
 >
 > Not there yet: playing a video where it sits, sending a zap, searching notes, and private messages.
 
@@ -99,6 +109,34 @@ reorder, and the renderer has no shaping.
 ```sh
 scripts/package-linux.sh --notary <path>   # -> dist/plaza-<version>-linux-<arch>.tar.gz
 ```
+
+## What it speaks
+
+Each line says how far Plaza goes with the protocol, so a NIP named here is supported to that extent and no further.
+
+| | Plaza |
+| --- | --- |
+| NIP-02 | Reads the people you follow from your contact list (kind 3), and Follow and Unfollow publish it back with everything else in it kept as it was. |
+| NIP-05 | Verifies a profile's `name@domain`, and the search field resolves one to the person it names. |
+| NIP-09 | Taking back a like publishes a deletion request (kind 5) for it. Nothing else is deleted. |
+| NIP-10 | Reads reply threads by their markers, and writes a reply with a `root` marker and a relay hint when it knows one. |
+| NIP-18 | Reposts (kinds 6 and 16) are read, and shown in the feed as the note itself. Plaza publishes a repost with the note's relay hint, and a quote as a `q` tag. |
+| NIP-19 | Opens `npub`, `nprofile`, `note`, `nevent` and `naddr`. An address it copies carries up to two relay hints, and the account menu copies an `nprofile`. |
+| NIP-22 | Reads a comment (kind 1111) as a reply in a thread and in notifications. A reply Plaza writes is a kind 1 note, not a comment. |
+| NIP-23 | Reads a long-form article (kind 30023) in full and opens one from an `naddr`. It does not open a draft (kind 30024) and does not write articles. |
+| NIP-25 | Likes are published with the relay hint in the `e` and `p` tags. |
+| NIP-27 | A `nostr:` reference to a person is shown as the name, and the first reference to a note or an article becomes a quote card. A quote you write is composed as one. |
+| NIP-36 | Covers a note that carries a `content-warning` tag, and adds the tag to a note when you ask. |
+| NIP-42 | Answers a relay's AUTH challenge when you have allowed it for that relay, as described above. |
+| NIP-44 | The private half of a mute or bookmark list is opened and sealed by the signer. A half written with NIP-04 is opened only through an external signer. |
+| NIP-46 | Signs through an external signer paired with a `bunker://` link. |
+| NIP-50 | Asks three search relays for people by name. It searches profiles only, not notes. |
+| NIP-51 | Reads and writes your mute list (kind 10000) and your bookmarks (kind 10003), public and private. A list Plaza could not read is never written over. |
+| NIP-57 | Shows a note's zap total and lists the zaps sent to you, checking the request inside each receipt. It does not send a zap and does not check a receipt against the recipient's LNURL server. |
+| NIP-65 | Reads where the people you follow write, and publishes your own relay list. |
+| NIP-89 | Adds a `client` tag to a note or repost you publish only when you turn that on in Settings. It is off by default. |
+| NIP-92 | Reads `imeta` for a picture's shape and placeholder, and writes it for a picture it uploads (url, type, hash, size, dimensions, blurhash and description). |
+| Blossom | Uploads a picture with BUD-02, signs the BUD-11 token, checks a server first with BUD-06 and reads your BUD-03 server list (kind 10063). |
 
 ## Where the feed comes from
 
@@ -311,10 +349,7 @@ comes out unjoined and left to right, and Devanagari and Thai unreordered. No
 face is bundled for those, because a wrong rendering is not obviously better
 than a missing one.
 
-Windows is not in the matrix at all: the relay transport resolves hostnames
-through libc `getaddrinfo`, which Zig's standard library does not declare for
-Windows, so nothing depending on the library links there
-(`zig-nostr/nostr#59`).
+Windows is not in the matrix. The `nostr` library builds for it as of v0.14.8, so that is no longer what stops it, but Plaza itself has not been built or tested there and there is no Windows release.
 
 ## License
 
