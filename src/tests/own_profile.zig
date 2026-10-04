@@ -595,6 +595,48 @@ test "the profile sheet shows the profile that went out, and a bio-only save kee
     try testing.expect(std.mem.indexOf(u8, next.content, "Alice") == null);
 }
 
+test "a list that ties with the one held keeps the tie's winner in the store" {
+    // A record stamped the same second as the held one clears the hold, and
+    // the held copy was dropped unoffered. When the stored one had the higher
+    // id, it was kept over the one that wins the tie on every relay.
+    defer main.resetOutboxForTest();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fs: FreshStore = undefined;
+    try fs.open("unstored-tie");
+    defer fs.close();
+    main.setIdentityForTest([_]u8{0x8f} ** 32);
+    defer main.clearIdentityForTest();
+    defer main.forgetMutesForTest();
+    defer main.failIngestForTest(false);
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{0x8f} ** 32);
+    const hex_a = std.fmt.bytesToHex([_]u8{0xa1} ** 32, .lower);
+    const hex_b = std.fmt.bytesToHex([_]u8{0xb2} ** 32, .lower);
+    const one = try nostr.event.create(arena, signer, kp, 1_900_000_000, 10000, &.{&.{ "p", &hex_a }}, "", null);
+    const two = try nostr.event.create(arena, signer, kp, 1_900_000_000, 10000, &.{&.{ "p", &hex_b }}, "", null);
+    const lower_first = std.mem.order(u8, &one.id, &two.id) == .lt;
+    const winner = if (lower_first) one else two;
+    const loser = if (lower_first) two else one;
+
+    // The winner went out and the store refused it.
+    main.failIngestForTest(true);
+    main.ingestAndPublishForTest(std.heap.page_allocator, winner);
+    main.failIngestForTest(false);
+    try testing.expect(main.heldOwnRecordForTest(10000));
+    // The loser arrives from a relay, is stored, and clears the hold.
+    _ = try main.plazaIngestVerifiedForTest(arena, loser, signer);
+    try testing.expect(!main.heldOwnRecordForTest(10000));
+
+    main.retryUnstoredOwnWrites(1_900_000_100);
+    const tags = main.ownRecordTagsJoinedForTest(testing.allocator, 10000) orelse return error.NothingStored;
+    defer testing.allocator.free(tags);
+    const want: []const u8 = if (lower_first) &hex_a else &hex_b;
+    try testing.expect(std.mem.indexOf(u8, tags, want) != null);
+}
+
 test "the length a seal must come back at is the length NIP-44 produces" {
     // The check before a sealed half is published compares its length with the
     // one this plaintext seals to. Wrong by a byte, it would refuse every good

@@ -283,7 +283,12 @@ pub fn retryUnstoredOwnWrites(now: i64) void {
     const gpa = std.heap.page_allocator;
     for (&g_unstored_at, 0..) |*at, i| {
         if (at.load(.acquire) == 0) {
-            // Read back, by a relay or by an earlier try.
+            // Read back, by a relay or by an earlier try. Offered once more
+            // first: a record stamped the same second clears the hold too, and
+            // when it is the one that loses NIP-01's tie on the id, the store
+            // would keep it over what went out. Offered, the store's own
+            // tie-break keeps the winner; anything older is refused as stale.
+            if (g_unstored_copy[i]) |copy| _ = plazaIngest(gpa, copy, .{}) catch {};
             if (g_unstored_copy[i] != null or g_unstored_tries[i] != 0) dropUnstoredCopy(i);
             continue;
         }
