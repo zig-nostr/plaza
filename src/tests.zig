@@ -31591,3 +31591,110 @@ test "a pressed hashtag opens the tag that was pressed, however many were drawn 
     const fresh = main.contentSpans(&ui, "#fresh")[0].link;
     try testing.expectEqualStrings("fresh", main.topicLinkValueForTest(fresh) orelse return error.NoTopic);
 }
+
+test "a bunker link signs the reader in when the signer answers, not before" {
+    defer main.resetBunkerConnectForTest();
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.joining = true;
+    model.bunker_mode = true;
+    var fx: main.EffectsForTest = undefined;
+
+    var id_buf: [24]u8 = undefined;
+    const id = main.beginBunkerConnectForTest([_]u8{0x5A} ** 32, &id_buf);
+
+    // Waiting: the sheet is up, the reader is a guest, and the button says so.
+    main.driveBunkerConnectForTest(&model);
+    try testing.expect(main.bunkerConnecting());
+    try testing.expect(model.is_guest());
+    try testing.expect(model.joining and model.bunker_mode);
+    try testing.expectEqualStrings("Connecting to your signer…", model.login_status());
+    // A second press while waiting does not replace the pairing.
+    model.login_buffer.set("bunker://anything");
+    main.update(&model, .login_submit, &fx);
+    try testing.expect(main.bunkerConnecting());
+
+    // The signer answers: now, and only now, the reader is in.
+    main.answerBunkerConnectForTest(id);
+    main.driveBunkerConnectForTest(&model);
+    try testing.expect(!main.bunkerConnecting());
+    try testing.expect(!model.is_guest());
+    try testing.expect(!model.joining and !model.bunker_mode);
+    try testing.expectEqual(main.Stage.ready, model.stage);
+}
+
+test "a bunker that does not answer leaves the reader a guest, with the reason" {
+    defer main.resetBunkerConnectForTest();
+    defer main.clearIdentityForTest();
+    var model = main.initialModel();
+    model.joining = true;
+    model.bunker_mode = true;
+    var fx: main.EffectsForTest = undefined;
+
+    var id_buf: [24]u8 = undefined;
+    const id = main.beginBunkerConnectForTest([_]u8{0x5B} ** 32, &id_buf);
+    // The send could not reach the relay, or the signer said no.
+    try testing.expect(main.failPendingForTest(id));
+    main.scanPendingRemoteForTest(&model, &fx);
+    main.driveBunkerConnectForTest(&model);
+
+    try testing.expect(!main.bunkerConnecting());
+    try testing.expect(model.is_guest());
+    try testing.expectEqualStrings("helper", main.signerKindNameForTest());
+    // Still on the sheet they pasted into, told what happened.
+    try testing.expect(model.joining and model.bunker_mode);
+    try testing.expect(std.mem.indexOf(u8, model.login_status(), "Couldn't connect to your signer") != null);
+    // And no sign request can be waiting on a signer that was never reached.
+    try testing.expect(main.takePendingContentForTest(id) == null);
+
+    // Backing out of the sheet while it waits cancels the pairing.
+    _ = main.beginBunkerConnectForTest([_]u8{0x5C} ** 32, &id_buf);
+    main.update(&model, .close_bunker, &fx);
+    try testing.expect(!main.bunkerConnecting());
+    try testing.expect(model.is_guest());
+    try testing.expectEqualStrings("", model.login_status());
+
+    // A request nothing is waiting for any more (it never went out) is a
+    // failure too, not a spinner.
+    _ = main.beginBunkerConnectForTest([_]u8{0x5D} ** 32, &id_buf);
+    main.clearPendingForTest();
+    main.driveBunkerConnectForTest(&model);
+    try testing.expect(!main.bunkerConnecting());
+}
+
+test "pasting a bunker link waits for the signer instead of signing in" {
+    defer main.resetBunkerConnectForTest();
+    defer main.clearIdentityForTest();
+    main.setIoForTest(testing.io);
+    defer main.setIoForTest(null);
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.joining = true;
+    model.bunker_mode = true;
+    var fx: main.EffectsForTest = undefined;
+
+    // A link that is not one. Nothing starts, and the sheet says it cannot read it.
+    model.login_buffer.set("bunker://not-a-key");
+    main.update(&model, .login_submit, &fx);
+    try testing.expect(!main.bunkerConnecting());
+    try testing.expect(model.is_guest());
+    try testing.expectEqualStrings("Couldn't read that bunker link.", model.login_status());
+
+    // A well-formed link to a relay nobody is listening on. The press connects,
+    // and that is all it does: no account, no feed, the sheet still up.
+    const link = "bunker://" ++ "ab" ** 32 ++ "?relay=wss://127.0.0.1:1&secret=abc";
+    model.login_buffer.set(link);
+    main.update(&model, .login_submit, &fx);
+    try testing.expect(main.bunkerConnecting());
+    try testing.expect(model.is_guest());
+    try testing.expect(model.joining and model.bunker_mode);
+    try testing.expectEqualStrings("Connecting to your signer…", model.login_status());
+
+    // The signer answers the request that went out, and then the reader is in.
+    var id_buf: [24]u8 = undefined;
+    const id = main.pendingConnectIdForTest(&id_buf) orelse return error.NoConnectRequest;
+    main.answerBunkerConnectForTest(id);
+    main.driveBunkerConnectForTest(&model);
+    try testing.expect(!model.is_guest());
+    try testing.expect(!model.joining and !model.bunker_mode);
+}

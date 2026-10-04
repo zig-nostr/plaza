@@ -4921,6 +4921,12 @@ var g_remote_secret_buf: [128]u8 = undefined;
 var g_remote_secret_len: usize = 0;
 // 0 idle, 1 connecting, 2 connected, 3 failed. Drives the onboarding status line.
 var g_remote_status = std.atomic.Value(u8).init(0);
+// Set from the moment a pasted bunker link starts connecting until its first
+// answer arrives. While it is set the connection exists but nobody is signed in
+// by it: a link that points at a relay nobody is listening on, or a signer that
+// is not running, must not turn into an account that looks fine and then cannot
+// sign. See `driveBunkerConnect`.
+var g_remote_confirming = std.atomic.Value(bool).init(false);
 
 // ------------------------------------------------- the isolated signer helper
 //
@@ -6561,7 +6567,7 @@ fn clearPending() void {
 // A synchronous error from the unified login field (nsec / bunker), shown under
 // it. `.none` while idle or when the async bunker path is in charge (its state
 // comes from `g_remote_status`). See `LoginError` and `Model.login_status`.
-const LoginError = enum(u8) { none = 0, format = 1, bad_key = 2, key_goes_to_notary = 3 };
+const LoginError = enum(u8) { none = 0, format = 1, bad_key = 2, key_goes_to_notary = 3, signer_silent = 4 };
 var g_login_error = std.atomic.Value(u8).init(0);
 
 /// What the pasted login text is: a signer to connect, a secret key that
@@ -11537,7 +11543,7 @@ fn nowSeconds() i64 {
 /// show alongside the follows you read.
 fn activePubkey() ?[32]u8 {
     return switch (g_signer_kind) {
-        .remote => g_remote_pubkey,
+        .remote => if (g_remote_confirming.load(.acquire)) null else g_remote_pubkey,
         .helper => if (g_helper_has_identity) g_helper_identity_pk else null,
     };
 }
@@ -12580,6 +12586,10 @@ pub const Model = struct {
             // Not an error the reader made. Their key is fine; it belongs in
             // the app that holds keys, and that app is opening.
             .key_goes_to_notary => return "Your key goes in Notary, not here. Opening it now.",
+            // The link was fine and the signer did not answer it: the relay in
+            // the link is down, or the signer is not running, or it said no.
+            // Nothing was signed in, so there is nothing to undo.
+            .signer_silent => return "Couldn't connect to your signer. Check that it is running and that the link is current, then try again.",
             .none => {},
         }
         return switch (g_remote_status.load(.acquire)) {
@@ -20606,7 +20616,7 @@ fn bunkerCard(ui: *AppUi, model: *const Model) AppUi.Node {
             .height = 56,
         }, .{}),
         ui.text(.{ .size = .sm, .wrap = true, .style = .{ .foreground = p.text_muted } }, model.login_status()),
-        ui.button(.{ .variant = .primary, .disabled = model.login_empty(), .on_press = .login_submit }, "Connect"),
+        ui.button(.{ .variant = .primary, .disabled = model.login_empty() or bunkerConnecting(), .on_press = .login_submit }, if (bunkerConnecting()) "Connecting…" else "Connect"),
         // Same as the ladder's way out: a button's own press slack is not
         // padding, so without this the Connect button sits 7pt off the card's
         // edge against 24 on the other three sides.
@@ -33852,6 +33862,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Retire timed-out or refused signer requests, restoring a lost
                 // draft to the composer (this thread owns it).
                 if (g_signer_kind == .remote) scanPendingRemote(model, fx);
+                driveBunkerConnect(model);
                 // The same question for the built-in signer, which had no
                 // answer to it at all: a sign that failed simply ended.
                 if (g_signer_kind == .helper) scanHelperSign(model);
@@ -34274,6 +34285,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .place_bounce => bouncePlace(),
         .place_step => |delta| stepPlace(delta),
         .close_join => {
+            if (bunkerConnecting()) abandonRemoteSigner(.none);
             model.joining = false;
             model.bunker_mode = false;
             // Dismissing the sheet is an answer: they chose not to sign in, so
@@ -34338,6 +34350,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             g_identity_minted_here = false;
         },
         .close_bunker => {
+            if (bunkerConnecting()) abandonRemoteSigner(.none);
             model.bunker_mode = false;
             model.login_buffer.clear();
             g_login_error.store(@intFromEnum(LoginError.none), .release);
@@ -34555,15 +34568,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // the feed comes up and posts route through it. A bad URL keeps
                 // us on onboarding with an error (see `login_status`).
                 .bunker => {
-                    if (!connectRemoteSigner(raw)) return;
-                    persistSession();
-                    // The connection is optimistic: land in the feed at once
-                    // (the composer line shows reaching/connected), close the
-                    // sheet, and reset the bunker step.
-                    model.joining = false;
-                    model.bunker_mode = false;
-                    enterFeed(model);
-                    replayPending(model);
+                    // One connection at a time: a second press would replace the
+                    // pairing the first is still waiting on.
+                    if (bunkerConnecting()) return;
+                    // Not signed in yet. The sheet stays up saying "Connecting
+                    // to your signer…" and `driveBunkerConnect` finishes the
+                    // sign-in on the signer's answer, or reports why not.
+                    _ = connectRemoteSigner(raw);
                 },
                 .invalid => g_login_error.store(@intFromEnum(LoginError.format), .release),
             }
@@ -35725,6 +35736,60 @@ pub fn handleNotaryExitedForTest(model: *Model, e: native_sdk.EffectExit) void {
 /// other process reaches Plaza. For tests.
 pub fn handleHelperPubkeyForTest(model: *Model, response: native_sdk.EffectResponse) void {
     handleHelperPubkey(model, response);
+}
+
+/// Starts connecting to a bunker the way `connectRemoteSigner` does, without a
+/// socket or a thread: the connection state is set, nobody is signed in, and a
+/// `connect` request is waiting for its answer. Returns that request's id. For
+/// tests.
+pub fn beginBunkerConnectForTest(pubkey: [32]u8, id_out: *[24]u8) []const u8 {
+    g_remote_pubkey = pubkey;
+    g_signer_kind = .remote;
+    g_remote_status.store(1, .release);
+    g_remote_sign_notice.store(false, .release);
+    g_remote_confirming.store(true, .release);
+    g_login_error.store(@intFromEnum(LoginError.none), .release);
+    _ = g_remote_generation.fetchAdd(1, .monotonic);
+    const id = "connect-for-test";
+    @memcpy(id_out[0..id.len], id);
+    _ = registerPending(id, .connect, null, false, .none, 0, no_half_id, .{});
+    return id_out[0..id.len];
+}
+
+/// Lends the app an io for the one place a test reaches for it (minting the
+/// ephemeral client key). For tests.
+pub fn setIoForTest(io: ?std.Io) void {
+    g_io = io;
+}
+
+/// The id of the `connect` request a pasted link left waiting, if any. For
+/// tests.
+pub fn pendingConnectIdForTest(out: *[24]u8) ?[]const u8 {
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (slot.active and slot.method == .connect) {
+            @memcpy(out[0..slot.id_len], slot.id());
+            return out[0..slot.id_len];
+        }
+    }
+    return null;
+}
+
+/// What the listener does with a `connect` answer from the signer. For tests.
+pub fn answerBunkerConnectForTest(id: []const u8) void {
+    _ = takePending(id);
+    g_remote_status.store(2, .release);
+}
+
+pub fn driveBunkerConnectForTest(model: *Model) void {
+    driveBunkerConnect(model);
+}
+
+/// Puts every piece of bunker state back to a guest's. For tests.
+pub fn resetBunkerConnectForTest() void {
+    abandonRemoteSigner(.none);
+    g_remote_confirming.store(false, .release);
 }
 
 /// Drives the remote-signer connection state (0 idle, 1 reaching, 2 connected,
@@ -42007,7 +42072,9 @@ fn fetchRepliesWorker(root_id: [32]u8, seq: u64) void {
 
 /// Pairs with an external signer from a `bunker://` URL: parses it, mints an
 /// ephemeral client key, starts the response listener, and sends the connect
-/// request. Returns false (and marks the status failed) on a bad URL.
+/// request. Returns false (and marks the status failed) on a bad URL. Returning
+/// true means the request is out, not that anyone is signed in: that happens
+/// when the signer answers it (see `driveBunkerConnect`).
 fn connectRemoteSigner(url_raw: []const u8) bool {
     const url = std.mem.trim(u8, url_raw, " \t\r\n");
     const io = g_io orelse return false;
@@ -42051,16 +42118,23 @@ fn connectRemoteSigner(url_raw: []const u8) bool {
     g_signer_kind = .remote;
     g_remote_status.store(1, .release);
     g_remote_sign_notice.store(false, .release);
+    // Nobody is signed in by this until the signer answers (see
+    // `driveBunkerConnect`).
+    g_remote_confirming.store(true, .release);
 
     // A fresh generation: any prior listener (a reconnect to a second bunker)
     // stops processing, and every request registered from here carries it.
     const generation = newRemoteGeneration();
 
-    const thread = std.Thread.spawn(.{}, nip46ReceiveLoop, .{ gpa, generation }) catch {
-        g_remote_status.store(3, .release);
-        return false;
-    };
-    thread.detach();
+    // The listener is a network thread, so a test build does not start one
+    // (see `networkAllowed`).
+    if (networkAllowed()) {
+        const thread = std.Thread.spawn(.{}, nip46ReceiveLoop, .{ gpa, generation }) catch {
+            abandonRemoteSigner(.signer_silent);
+            return false;
+        };
+        thread.detach();
+    }
 
     sendConnect(gpa);
     return true;
@@ -42068,6 +42142,75 @@ fn connectRemoteSigner(url_raw: []const u8) bool {
 
 /// Request ids a unit test hands out, which has no io to draw them from.
 var g_test_request_seq: u32 = 0;
+/// Whether a `connect` request is still waiting for its answer in this
+/// generation.
+fn connectInFlight() bool {
+    const generation = g_remote_generation.load(.acquire);
+    pendingLock();
+    defer pendingUnlock();
+    for (&g_pending) |*slot| {
+        if (slot.active and slot.method == .connect and slot.generation == generation and !slot.failed) return true;
+    }
+    return false;
+}
+
+/// Takes back a bunker connection that never became a sign-in: the listener is
+/// stopped, the request table emptied, and the reader is a guest again with the
+/// reason on the sheet they are still looking at.
+fn abandonRemoteSigner(why: LoginError) void {
+    // Bumped first, so the detached listener stops processing before the state
+    // it reads is taken away.
+    _ = g_remote_generation.fetchAdd(1, .monotonic);
+    clearPending();
+    g_remote_confirming.store(false, .release);
+    g_remote_sign_notice.store(false, .release);
+    g_identity_npub_len = 0;
+    g_signer_kind = .helper;
+    g_remote_client_kp = null;
+    g_remote_relay_len = 0;
+    g_remote_secret_len = 0;
+    g_remote_status.store(0, .release);
+    g_login_error.store(@intFromEnum(why), .release);
+}
+
+/// Whether a pasted bunker link is still waiting on its signer.
+pub fn bunkerConnecting() bool {
+    return g_remote_confirming.load(.acquire);
+}
+
+/// The tick's half of connecting a pasted bunker link: signs the reader in once
+/// the signer has answered, and gives the sheet an error when it has not.
+///
+/// The link used to sign the reader in the moment it parsed. A link to a relay
+/// that was down then produced an account, a green dot, and a repost that sat
+/// on "Reposted" for thirty seconds before failing, with the reason only in a
+/// log. The answer to `connect` is the proof that the signer exists, is
+/// reachable and took this client, so it is what the sign-in waits for.
+fn driveBunkerConnect(model: *Model) void {
+    if (!g_remote_confirming.load(.acquire)) return;
+    // Something else took the seat (a keyholder key adopted while waiting).
+    if (g_signer_kind != .remote) {
+        g_remote_confirming.store(false, .release);
+        return;
+    }
+    switch (g_remote_status.load(.acquire)) {
+        2 => {
+            g_remote_confirming.store(false, .release);
+            g_login_error.store(@intFromEnum(LoginError.none), .release);
+            persistSession();
+            model.joining = false;
+            model.bunker_mode = false;
+            model.login_buffer.clear();
+            enterFeed(model);
+            replayPending(model);
+        },
+        // The request failed or ran out its thirty seconds.
+        3 => abandonRemoteSigner(.signer_silent),
+        // Connecting. If nothing is in flight any more there is nothing to wait
+        // for: the request never went out.
+        else => if (!connectInFlight()) abandonRemoteSigner(.signer_silent),
+    }
+}
 
 /// A request id nobody watching the relay can guess.
 ///
@@ -42218,7 +42361,10 @@ fn sendRequest(gpa: std.mem.Allocator, request: nostr.nip46.Request) void {
     // depending on one existing.
     if (!networkAllowed()) return;
     const req_json = request.toJson(gpa) catch return;
-    const thread = std.Thread.spawn(.{}, nip46Send, .{ gpa, req_json }) catch {
+    var id_buf: [24]u8 = undefined;
+    const id_len = @min(request.id.len, id_buf.len);
+    @memcpy(id_buf[0..id_len], request.id[0..id_len]);
+    const thread = std.Thread.spawn(.{}, nip46Send, .{ gpa, req_json, id_buf, id_len }) catch {
         gpa.free(req_json);
         return;
     };
@@ -42227,10 +42373,19 @@ fn sendRequest(gpa: std.mem.Allocator, request: nostr.nip46.Request) void {
 
 /// Seals `req_json` to the remote signer and publishes it on a throwaway
 /// connection to the bunker relay. Owns `req_json`. Its own io and signer.
-fn nip46Send(gpa: std.mem.Allocator, req_json: []const u8) void {
+fn nip46Send(gpa: std.mem.Allocator, req_json: []const u8, req_id: [24]u8, req_id_len: usize) void {
     defer gpa.free(req_json);
     const client_kp = g_remote_client_kp orelse return;
+    sendNip46(gpa, req_json, client_kp) catch {
+        // A request that could not even be put on the wire has no answer
+        // coming, so its slot is flagged failed now rather than left to run out
+        // its thirty seconds. The tick retires it the same way it retires a
+        // refusal.
+        _ = failPending(req_id[0..req_id_len]);
+    };
+}
 
+fn sendNip46(gpa: std.mem.Allocator, req_json: []const u8, client_kp: nostr.keys.KeyPair) !void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -42238,10 +42393,10 @@ fn nip46Send(gpa: std.mem.Allocator, req_json: []const u8) void {
     defer signer.deinit();
 
     const created_at = std.Io.Timestamp.now(io, .real).toSeconds();
-    var sealed = nostr.nip46.seal(gpa, io, signer, client_kp, g_remote_pubkey, req_json, created_at) catch return;
+    var sealed = try nostr.nip46.seal(gpa, io, signer, client_kp, g_remote_pubkey, req_json, created_at);
     defer sealed.deinit();
 
-    var relay = nostr.relay.dial(gpa, io, g_remote_relay_buf[0..g_remote_relay_len]) catch return;
+    var relay = try nostr.relay.dial(gpa, io, g_remote_relay_buf[0..g_remote_relay_len]);
     defer relay.deinit();
     // The read below waits for the relay's OK. Without a deadline a bunker
     // relay that accepts the publish and says nothing holds this thread, and
@@ -42249,7 +42404,7 @@ fn nip46Send(gpa: std.mem.Allocator, req_json: []const u8) void {
     // the life of the process, every time the reader signed anything.
     const watched = watchOneShot(io, relay, one_shot_budget_ms);
     defer releaseOneShot(watched);
-    relay.publish(sealed.event) catch return;
+    try relay.publish(sealed.event);
     // Read the relay's OK so the frame flushes before we close; best-effort.
     var msg = (relay.receive() catch return) orelse return;
     msg.deinit();
