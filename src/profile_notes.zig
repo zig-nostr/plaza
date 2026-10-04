@@ -6,6 +6,7 @@ const native_sdk = @import("native_sdk");
 const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
+const navigation = @import("navigation.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -453,7 +454,7 @@ pub fn loadOlderProfile(model: *Model) void {
     // moment it opens, and paging from the one note the store had then would ask
     // for history the first fetch is already bringing, and find the end of it
     // by being second.
-    if (main.g_thread_done_seq.load(.acquire) < model.thread_seq) return;
+    if (navigation.g_thread_done_seq.load(.acquire) < model.thread_seq) return;
     const cursor = profileOlderCursor(model, pk);
     model.profile_asked_until = cursor;
     fetchOlderProfile(pk, cursor);
@@ -494,7 +495,7 @@ pub fn loadAtProfileBottom(model: *Model) void {
     if (model.thread_notes_len == 0) return;
     // The page's own first fetch is still out. Asking for older notes before the
     // newest have landed would page from a cursor that is about to move.
-    if (main.g_thread_done_seq.load(.acquire) < model.thread_seq) return;
+    if (navigation.g_thread_done_seq.load(.acquire) < model.thread_seq) return;
     if (g_profile_older_busy.load(.monotonic) or profileEndReached(pk)) return;
     // The store has nothing more and the relays were already asked from here.
     if (model.thread_notes_len < model.profile_limit and profileOlderCursor(model, pk) == model.profile_asked_until) return;
