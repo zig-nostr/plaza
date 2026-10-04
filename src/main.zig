@@ -34,6 +34,7 @@ const article = @import("article.zig");
 const blossom = @import("blossom.zig");
 const tuning = @import("tuning.zig");
 const hiding = @import("hiding.zig");
+const prefs = @import("prefs.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -3988,10 +3989,10 @@ fn median(sorted: []const u16) u16 {
 /// redesign asks for the median WRITE relay, the number that predicts how fast a
 /// post lands; until a relay list with read/write markers exists, every relay in// The UI thread's Io, for wall-clock time when rendering relative timestamps
 // (set once in `main`, read only on the UI thread).
-var g_io: ?std.Io = null;
+pub var g_io: ?std.Io = null;
 // The process environment, stashed in `main` so the onboarding "create identity"
 // action can resolve `$HOME` and open the store off the UI thread event loop.
-var g_environ: ?*const std.process.Environ.Map = null;
+pub var g_environ: ?*const std.process.Environ.Map = null;
 // The event count at the last feed rebuild, a cheap "did the store change?"
 // signal so a tick that changed nothing skips the query and note rebuild.
 var g_last_count: usize = std.math.maxInt(usize);
@@ -6064,158 +6065,6 @@ pub fn classifyLogin(text: []const u8) LoginTarget {
 // the user prefers, including their own). Clearing the setting loads originals
 // straight from their host, which still works for anything small enough.
 
-const default_media_proxy = "https://wsrv.nl/";
-/// Whether the app reaches out for the things a note POINTS AT: its picture, the
-/// faces of the people in the feed, the page a link goes to, and the domain a
-/// NIP-05 name claims. On by default, because a feed of grey boxes is not the
-/// app. Off, none of that leaves the machine until the reader asks for a
-/// particular picture, and the only hosts that learn anything are the relays,
-/// which are the ones the reader chose.
-///
-/// It covers every unattended fetch, deliberately: gating only the pictures
-/// would leave each author's own domain and every avatar host still learning
-/// that you are reading, which is exactly what the switch is for.
-var g_media_previews: bool = true;
-
-pub fn mediaPreviews() bool {
-    return g_media_previews;
-}
-
-pub fn setMediaPreviews(on: bool) void {
-    g_media_previews = on;
-}
-
-/// Whether notes their authors marked sensitive (NIP-36) are drawn like any
-/// other. OFF by default: the author asked for the note to be covered and the
-/// reader has not said they would rather not be asked. Jumble keeps the same
-/// switch (`NSFW_DISPLAY_POLICY.SHOW`, `src/constants.ts:329`) and Amethyst's
-/// `WarningType` has a Show entry (`SecurityFiltersScreen.kt:116`); both default
-/// to covering.
-var g_show_sensitive: bool = false;
-
-pub fn showSensitive() bool {
-    return g_show_sensitive;
-}
-
-pub fn setShowSensitive(on: bool) void {
-    g_show_sensitive = on;
-}
-/// Whether notes published from here say so, with NIP-89's `client` tag.
-///
-/// OFF by default. The tag is a small permanent fact about the reader attached
-/// to everything they write: not what they said, but what they said it WITH, and
-/// it follows the note to every relay and every client forever. NIP-89 puts the
-/// privacy question in the spec itself ("clients SHOULD allow users to opt-out
-/// of using this tag"), which is unusual enough to be worth reading as a hint
-/// about which way the default should fall.
-///
-/// The argument the other way is real and lost: this is how anyone discovers a
-/// new client exists at all. Sepehr chose the private default (2026-07-31), so
-/// Plaza is invisible in other people's clients unless the reader decides
-/// otherwise. Reading the tag on OTHER people's notes is unaffected: that is
-/// their disclosure, already made.
-var g_client_tag: bool = false;
-
-pub fn clientTag() bool {
-    return g_client_tag;
-}
-
-pub fn setClientTag(on: bool) void {
-    g_client_tag = on;
-}
-
-/// What Plaza calls itself in that tag. NIP-89's full tuple also carries a
-/// `31990:<pubkey>:<d>` handler address and a relay hint, which point at a
-/// handler event Plaza does not publish; the name alone is valid, and is what
-/// most clients actually emit.
-const client_tag_name = "Plaza";
-
-var g_media_proxy_buf: [200]u8 = undefined;
-var g_media_proxy_len: usize = 0;
-
-/// The configured proxy base URL, empty when images load directly.
-pub fn mediaProxy() []const u8 {
-    return g_media_proxy_buf[0..g_media_proxy_len];
-}
-
-/// Sets the proxy base URL (trimmed; empty disables proxying).
-/// Whether image URLs are routed through the proxy at all.
-///
-/// ON by default, and not only for privacy: the proxy RESIZES. The registry
-/// decodes at most 512x512, so a 2040x1536 photograph is 611 KB direct and a
-/// fraction of that proxied, and the difference is downloaded and thrown away.
-/// One note with three pictures measured 825 KB direct.
-var g_media_proxy_on: bool = true;
-
-/// Whether a picture the proxy REFUSES is then fetched from its own host.
-///
-/// ON by default, because the alternative is a broken picture, and a broken
-/// picture reads as a broken app. The public proxy blocks whole TLDs by policy
-/// (code 400, "Domain or TLD blocked by policy") for Blossom hosts that serve
-/// the same file directly without complaint, and that is not something this app
-/// can fix from here.
-///
-/// The cost is stated rather than hidden: a fallback fetch is a request to that
-/// host, so it sees the reader's address. Turning it off means those pictures do
-/// not load at all, which is a legitimate thing to want and is why this is a
-/// switch rather than a silent behaviour.
-var g_media_direct_fallback: bool = true;
-
-pub fn mediaProxyOn() bool {
-    return g_media_proxy_on;
-}
-
-pub fn setMediaProxyOn(on: bool) void {
-    g_media_proxy_on = on;
-    // A proxy that has just been switched on has refused nothing yet, and one
-    // switched off has no policy to remember.
-    forgetProxyRefusals();
-}
-
-pub fn mediaDirectFallback() bool {
-    return g_media_direct_fallback;
-}
-
-pub fn setMediaDirectFallback(on: bool) void {
-    g_media_direct_fallback = on;
-}
-
-/// Whether a typed proxy base is one this app can build a request from: an
-/// `http://` or `https://` address that names a host, with no space or control
-/// byte in it, short enough for the buffer it is kept in. Empty is not asked
-/// here, because empty is a choice (load originals) and the caller decides it.
-///
-/// Plain `http://` is allowed, unlike a relay: the proxy is the reader's own
-/// pick, often an instance on their own network, and what it carries is
-/// pictures that were public to begin with.
-pub fn isMediaProxyUrl(url: []const u8) bool {
-    const rest = if (std.mem.startsWith(u8, url, "https://"))
-        url["https://".len..]
-    else if (std.mem.startsWith(u8, url, "http://"))
-        url["http://".len..]
-    else
-        return false;
-    if (url.len > g_media_proxy_buf.len) return false;
-    for (url) |c| {
-        if (c <= 0x20 or c == 0x7f) return false;
-    }
-    const host_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
-    const host = rest[0..host_end];
-    if (host.len == 0 or host[0] == ':') return false;
-    return std.mem.indexOfScalar(u8, host, '@') == null;
-}
-
-pub fn setMediaProxy(url: []const u8) void {
-    const trimmed = std.mem.trim(u8, url, " \t\r\n");
-    const n = @min(trimmed.len, g_media_proxy_buf.len);
-    @memcpy(g_media_proxy_buf[0..n], trimmed[0..n]);
-    g_media_proxy_len = n;
-    // A different proxy answers for itself rather than inheriting the last
-    // one's policy. The per-face flag already followed this rule; the hosts
-    // now follow it too, in one place instead of three.
-    forgetProxyRefusals();
-}
-
 /// Whether the host serves its own resized variants via `?w=`, letting us skip
 /// the proxy hop entirely. nostr.build's Blossom hosts do; most others ignore it.
 fn hostSupportsWidthParam(src: []const u8) bool {
@@ -6252,7 +6101,7 @@ pub fn mediaUrl(out: []u8, src: []const u8, width: u32, fit: MediaFit) []const u
         return std.fmt.bufPrint(out, "{s}?w={d}", .{ src, width }) catch src;
     }
     const proxy = mediaProxy();
-    if (!g_media_proxy_on or proxy.len == 0) return src;
+    if (!prefs.g_media_proxy_on or proxy.len == 0) return src;
 
     var encoded_buf: [768]u8 = undefined;
     const encoded = percentEncode(&encoded_buf, src) orelse return src;
@@ -7750,7 +7599,7 @@ fn linkFor(url: []const u8) ?*LinkPreview {
 /// Asks for the pages the reader can actually see. Gated by the previews
 /// setting, like pictures: with it off, no page learns it was linked to.
 fn scanLinkFetches(fx: *Effects, model: *const Model) void {
-    if (!g_media_previews) return;
+    if (!prefs.g_media_previews) return;
     g_link_clock += 1;
     var fired: usize = 0;
     if (model.viewing_profile != null) {
@@ -11927,7 +11776,7 @@ pub const Model = struct {
     pub fn proxy_status(self: *const Model) []const u8 {
         if (self.proxy_invalid) return "Not saved. A proxy address starts with https:// or http:// and names a host.";
         if (!self.proxy_saved) return "";
-        return if (g_media_proxy_len == 0) "Saved. Loading originals directly." else "Saved.";
+        return if (prefs.g_media_proxy_len == 0) "Saved. Loading originals directly." else "Saved.";
     }
     /// What signs for this account, as a sentence rather than a badge.
     pub fn signer_line(self: *const Model) []const u8 {
@@ -11957,14 +11806,14 @@ pub const Model = struct {
     /// Whether the app is allowed to fetch what a note names.
     pub fn previews_on(self: *const Model) bool {
         _ = self;
-        return g_media_previews;
+        return prefs.g_media_previews;
     }
     /// Whether covered notes are drawn without their cover.
     pub fn sensitive_on(_: *const Model) bool {
-        return g_show_sensitive;
+        return prefs.g_show_sensitive;
     }
     pub fn sensitive_explainer(_: *const Model) []const u8 {
-        return if (g_show_sensitive)
+        return if (prefs.g_show_sensitive)
             "On. Notes their authors marked sensitive are drawn like any other, pictures included, and nothing asks first."
         else
             "Off. A note its author marked sensitive stays covered, and nothing it points at is fetched, until you press it.";
@@ -12153,7 +12002,7 @@ pub const Model = struct {
     }
     pub fn proxy_on(self: *const Model) bool {
         _ = self;
-        return g_media_proxy_on;
+        return prefs.g_media_proxy_on;
     }
     pub fn proxy_explainer(self: *const Model) []const u8 {
         _ = self;
@@ -12162,7 +12011,7 @@ pub const Model = struct {
     }
     pub fn direct_fallback_on(self: *const Model) bool {
         _ = self;
-        return g_media_direct_fallback;
+        return prefs.g_media_direct_fallback;
     }
     pub fn direct_fallback_explainer(self: *const Model) []const u8 {
         _ = self;
@@ -13789,7 +13638,7 @@ fn claimAvatarSlot(fx: *Effects, p: *Profile) void {
 /// on claim, "registered before the first paint") turns that into an instant
 /// face when the row does arrive.
 fn warmAhead(fx: *Effects, model: *const Model) void {
-    if (!g_media_previews) return;
+    if (!prefs.g_media_previews) return;
     // Only the feed. A thread or a profile is a bounded level whose rows are all
     // fetched by the pass that owns it, and widening those would spend bandwidth
     // on rows that do not exist.
@@ -13971,7 +13820,7 @@ fn handleMediaWarmed(response: native_sdk.EffectResponse) void {
 /// The response lands on `avatar_fetched`.
 fn scanAvatarFetches(fx: *Effects) void {
     // A face is something the note points at, like its picture.
-    if (!g_media_previews) return;
+    if (!prefs.g_media_previews) return;
     const per_tick = 8;
     var fired: usize = 0;
     for (&g_profiles, 0..) |*p, i| {
@@ -14039,7 +13888,7 @@ fn handleAvatarFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         // being unusable, so it gets the source itself rather than another go
         // at the same wall. Once per face, and only while the proxy is what was
         // used, so it can never loop. The attempt counter is untouched.
-        if (g_media_direct_fallback and g_media_proxy_on and !p.avatar_direct and
+        if (prefs.g_media_direct_fallback and prefs.g_media_proxy_on and !p.avatar_direct and
             proxyRefusedHost(response.outcome, response.status))
         {
             // Written down for the whole host, not just this face: the refusal
@@ -14107,7 +13956,7 @@ fn scanNip05Fetches(fx: *Effects) void {
     // this key, from the reader's own address. That is the same disclosure the
     // switch exists to stop, so it stops here too, and unverified names simply
     // show without a check.
-    if (!g_media_previews) return;
+    if (!prefs.g_media_previews) return;
     const per_tick = 4;
     var fired: usize = 0;
     for (&g_profiles, 0..) |*p, i| {
@@ -14163,7 +14012,7 @@ const update_check_url = "https://api.github.com/repos/zig-nostr/plaza/releases/
 /// on a timer should say so and let it be switched off, and while it is off it
 /// makes no request. The gate is in `maybeCheckForUpdate` before the fetch, not
 /// in the handler after it.
-var g_update_check: bool = true;
+pub var g_update_check: bool = true;
 /// The newest release seen, when it is newer than this build. Empty otherwise.
 var g_update_version_buf: [24]u8 = @splat(0);
 var g_update_version_len: usize = 0;
@@ -15317,7 +15166,7 @@ fn markQuoteMediaWanted(note: *const Note, collapsible: bool) void {
 /// ask for: the card names the picture and where it is from, and the press that
 /// was always there opens the note, where asking is offered.
 fn fireQuoteMedia(fx: *Effects, note: *const Note, collapsible: bool, fired: *usize, per_tick: usize) void {
-    if (!g_media_previews) return;
+    if (!prefs.g_media_previews) return;
     const q = quotePictureFor(note, collapsible) orelse return;
     fireMediaSlot(fx, quoteMediaKey(q.id), q.imageUrl(), fired, per_tick);
 }
@@ -15361,7 +15210,7 @@ fn fireMediaAt(fx: *Effects, note: *const Note, index: usize, fired: *usize, per
     // With previews off, nothing leaves the machine until the reader asks for
     // this note's pictures. That is the point of the setting: not bandwidth, but
     // that reading a feed should not tell every host in it that you did.
-    if (!g_media_previews and !isMediaAsked(note.id)) return;
+    if (!prefs.g_media_previews and !isMediaAsked(note.id)) return;
     fireMediaSlot(fx, mediaKey(note.id, index), link, fired, per_tick);
 }
 
@@ -15706,7 +15555,7 @@ fn handleMediaFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         // never loop and never fires for a fetch that was already direct. The
         // attempt counter is untouched: this is a different question, not
         // another go at the same one.
-        if (g_media_direct_fallback and g_media_proxy_on and !slot.direct and
+        if (prefs.g_media_direct_fallback and prefs.g_media_proxy_on and !slot.direct and
             proxyRefusedHost(response.outcome, response.status))
         {
             // Under the HOST, because this slot is not a place to keep it: the
@@ -20724,7 +20573,7 @@ fn noteRowEstimateWith(note: *const Note, chrome: f32, media: bool) f32 {
     }
     // A picture nobody asked for is one quiet chip, not a reserved box.
     if (note.hasImage()) {
-        const shown = g_media_previews or isMediaAsked(note.id) or note.media_id() != 0;
+        const shown = prefs.g_media_previews or isMediaAsked(note.id) or note.media_id() != 0;
         extent += (if (shown) pictureHeight(note) else picture_ask_height) + 8;
     }
     // The quote, which is only now a knowable height: the clamp is what makes it
@@ -23805,7 +23654,7 @@ fn privateMutes(gpa: std.mem.Allocator, content: []const u8, out: [][32]u8) usiz
 /// payment for one press. An imported key defaults to `following`, because they
 /// arrived with a list and it is the reason they signed in.
 pub const HomeScope = enum { starter_pack, following };
-var g_home_scope: HomeScope = .following;
+pub var g_home_scope: HomeScope = .following;
 
 /// Whether Home is reading the pack right now.
 ///
@@ -25955,7 +25804,7 @@ fn scanBannerFetch(fx: *Effects, model: *const Model) void {
     // On screen this pass, so the allocator will not take it out from under the
     // reader while they are looking at it.
     g_banner_seen = g_image_clock;
-    if (!g_media_previews) return;
+    if (!prefs.g_media_previews) return;
     const changed = if (g_banner_for) |who| !std.mem.eql(u8, &who, &pubkey) else true;
     if (changed) {
         g_banner_for = pubkey;
@@ -26047,7 +25896,7 @@ fn handleBannerFetched(fx: *Effects, response: native_sdk.EffectResponse) void {
         g_banner_down.release();
         // The proxy refusing the HOST, not the picture. Once, and only while
         // the proxy is what was used.
-        if (g_media_direct_fallback and g_media_proxy_on and !g_banner_direct and
+        if (prefs.g_media_direct_fallback and prefs.g_media_proxy_on and !g_banner_direct and
             proxyRefusedHost(response.outcome, response.status))
         {
             rememberHostRefusal(g_banner_host_buf[0..g_banner_host_len]);
@@ -28071,7 +27920,7 @@ fn scanPlaceLogo(fx: *Effects, model: *const Model) void {
         // the pool may take the slot this is about to ask for.
         g_place_logo_seen = g_image_clock;
     }
-    if (!g_media_previews) return;
+    if (!prefs.g_media_previews) return;
     const logo = place.logo();
     if (logo.len == 0) return;
     if (g_place_logo_state != .idle) return;
@@ -30222,7 +30071,7 @@ pub fn forgetUncoveredForTest() void {
 /// this one. The ONE answer every surface asks, so the text, the pictures, the
 /// link card, the fetches and the row's height cannot disagree about it.
 fn warningCovered(warned: bool, key: i64) bool {
-    return warned and !g_show_sensitive and !isUncovered(key);
+    return warned and !prefs.g_show_sensitive and !isUncovered(key);
 }
 
 /// Whether `note` is covered. Its pictures and link are covered with it, and
@@ -30648,7 +30497,7 @@ fn unsupportedKindChip(ui: *AppUi, kind: u16) AppUi.Node {
 /// off keeps the old, honest chip (nothing is fetched, so nothing could be
 /// drawn), and so does a quote with no address worth fetching.
 fn quoteShowsPicture(q: *const QuoteEntry) bool {
-    return g_media_previews and q.image_url_len > 0 and !quoteCovered(q);
+    return prefs.g_media_previews and q.image_url_len > 0 and !quoteCovered(q);
 }
 
 /// The shape to reserve for a quote's picture: what its `imeta` declares, else
@@ -31508,7 +31357,7 @@ fn notePicture(ui: *AppUi, note: *const Note) AppUi.Node {
     // Previews off and this one not asked for: a quiet line saying what is there
     // and what pressing it costs, not a box of reserved space for a picture that
     // is not coming.
-    if (!g_media_previews and !isMediaAsked(note.id) and image_id == 0) return pictureAskChip(ui, note);
+    if (!prefs.g_media_previews and !isMediaAsked(note.id) and image_id == 0) return pictureAskChip(ui, note);
     // Asked for and not had. The striped box below means "still coming", and it
     // meant that for a 404 too: the view only asked whether the picture was
     // LOADED, so every state that is not loaded drew the same waiting frame and
@@ -31553,7 +31402,7 @@ fn noteGallery(ui: *AppUi, note: *const Note) AppUi.Node {
 
     // Previews off: one chip for the whole set rather than one per picture,
     // because the reader is deciding about the note, not about picture three.
-    if (!g_media_previews and !isMediaAsked(note.id)) return pictureAskChip(ui, note);
+    if (!prefs.g_media_previews and !isMediaAsked(note.id)) return pictureAskChip(ui, note);
 
     const cells = @min(count, max_note_images);
     const width = (picture_column_width - gallery_gap * @as(f32, @floatFromInt(cells - 1))) / @as(f32, @floatFromInt(cells));
@@ -32716,7 +32565,7 @@ fn placeFeedWorker(url_buf: [place_relay_cap]u8, url_len: usize, kinds_buf: [pla
 ///
 /// Off by default: a reader with no places should never be given a column that
 /// only says it is empty. Entering a place turns it on, and it stays on.
-var g_rail_open: bool = false;
+pub var g_rail_open: bool = false;
 
 /// What the place's Info card is doing.
 ///
@@ -33229,7 +33078,7 @@ pub fn activePlaceIndexForTest() ?usize {
 var g_boot_place_author: [32]u8 = @splat(0);
 var g_boot_place_ident_buf: [64]u8 = @splat(0);
 var g_boot_place_ident_len: u8 = 0;
-var g_boot_place_set: bool = false;
+pub var g_boot_place_set: bool = false;
 
 /// `<64 hex>:<d>`, or empty for your own Plaza. Written by author and `d`
 /// rather than by position, so leaving a place cannot silently reopen whichever
@@ -36180,7 +36029,7 @@ fn firePost(model: *Model, fx: *Effects, route: ?PlaceRoute) bool {
 /// does not post read as a fault before it reads as a safeguard, and nobody
 /// asked for their existing habit to change. The cost is honest: a pause nobody
 /// finds helps nobody, so it sits in Settings where it can be found.
-var g_post_delay_s: i64 = 0;
+pub var g_post_delay_s: i64 = 0;
 
 /// When the held note is due, or 0 when nothing is held.
 var g_post_due_s: i64 = 0;
@@ -36409,7 +36258,7 @@ fn signAndPublish(fx: *Effects, gpa: std.mem.Allocator, created: i64, kind: u16,
 /// widely for no reader-visible benefit, which is the opposite of what an opt-in
 /// privacy switch is for.
 pub fn withClientTag(gpa: std.mem.Allocator, kind: u16, tags: []const nostr.event.Tag) []const nostr.event.Tag {
-    if (!g_client_tag) return tags;
+    if (!prefs.g_client_tag) return tags;
     if (kind != 1 and kind != 6) return tags;
     const tag = gpa.dupe([]const u8, &.{ "client", client_tag_name }) catch return tags;
     const out = gpa.alloc(nostr.event.Tag, tags.len + 1) catch return tags;
@@ -43482,7 +43331,7 @@ fn openFeedStore(io: std.Io, environ: *const std.process.Environ.Map) !nostr.sto
 // onboarding option, and swaps in at `signAndPublish`.
 
 /// Opens (creating if needed) `$HOME/.plaza`, returning the directory handle.
-fn plazaDir(io: std.Io, environ: *const std.process.Environ.Map) !std.Io.Dir {
+pub fn plazaDir(io: std.Io, environ: *const std.process.Environ.Map) !std.Io.Dir {
     const home = environ.get("HOME") orelse ".";
     var dir_buf: [512]u8 = undefined;
     const dir_path = try std.fmt.bufPrint(&dir_buf, "{s}/.plaza", .{home});
@@ -43652,67 +43501,6 @@ fn restoreRemoteSigner(gpa: std.mem.Allocator, pubkey_hex: []const u8, relay: []
     thread.detach();
     sendConnect(gpa);
     return true;
-}
-
-/// Loads app-wide settings (the media proxy) from `$HOME/.plaza/settings`,
-/// starting from the default so a fresh install proxies out of the box.
-fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
-    setMediaProxy(default_media_proxy);
-    g_media_previews = true;
-    g_show_sensitive = false;
-    g_client_tag = false;
-    g_update_check = true;
-    g_media_proxy_on = true;
-    g_media_direct_fallback = true;
-    hiding.g_hidden = @splat(false);
-    g_rail_open = false;
-    g_boot_place_set = false;
-    var dir = plazaDir(io, environ) catch return;
-    defer dir.close(io);
-    const gpa = std.heap.page_allocator;
-    const raw = dir.readFileAlloc(io, "settings", gpa, std.Io.Limit.limited(2048)) catch return;
-    defer gpa.free(raw);
-    var lines = std.mem.splitScalar(u8, raw, '\n');
-    while (lines.next()) |line| {
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        // An empty value is meaningful: the user chose to load originals.
-        // Anything that is not an address keeps the default. A value written
-        // before the field checked what it was given would otherwise send every
-        // uncached picture to a URL that goes nowhere.
-        if (std.mem.eql(u8, line[0..eq], "media_proxy")) {
-            const value = std.mem.trim(u8, line[eq + 1 ..], " \t\r\n");
-            if (value.len == 0 or isMediaProxyUrl(value)) setMediaProxy(value);
-        }
-        if (std.mem.eql(u8, line[0..eq], "media_previews")) g_media_previews = std.mem.eql(u8, line[eq + 1 ..], "on");
-        if (std.mem.eql(u8, line[0..eq], "show_sensitive")) g_show_sensitive = std.mem.eql(u8, line[eq + 1 ..], "on");
-        if (std.mem.eql(u8, line[0..eq], "client_tag")) g_client_tag = std.mem.eql(u8, line[eq + 1 ..], "on");
-        if (std.mem.eql(u8, line[0..eq], "update_check")) g_update_check = std.mem.eql(u8, line[eq + 1 ..], "on");
-        if (std.mem.eql(u8, line[0..eq], "media_proxy_on")) g_media_proxy_on = std.mem.eql(u8, line[eq + 1 ..], "on");
-        if (std.mem.eql(u8, line[0..eq], "media_direct_fallback")) g_media_direct_fallback = std.mem.eql(u8, line[eq + 1 ..], "on");
-        // Written by id rather than by position, so adding an element to the
-        // registry, or reordering it, cannot silently un-hide something.
-        if (std.mem.eql(u8, line[0..eq], "hidden")) applyHiddenLine(line[eq + 1 ..]);
-        if (std.mem.eql(u8, line[0..eq], "rail_open")) g_rail_open = std.mem.eql(u8, line[eq + 1 ..], "on");
-        // Only a name this app wrote. Anything else keeps the default, which
-        // for a key made here is set at the mint and for every other key is
-        // their own follows.
-        if (std.mem.eql(u8, line[0..eq], "home_scope")) {
-            const val = line[eq + 1 ..];
-            if (std.mem.eql(u8, val, "starter_pack")) g_home_scope = .starter_pack;
-            if (std.mem.eql(u8, val, "following")) g_home_scope = .following;
-        }
-        if (std.mem.eql(u8, line[0..eq], "post_delay")) {
-            // Anything unreadable keeps the default rather than turning the
-            // pause off: a corrupt line should not quietly remove a safeguard.
-            const n = std.fmt.parseInt(i64, line[eq + 1 ..], 10) catch continue;
-            g_post_delay_s = switch (n) {
-                0, 5, 10 => n,
-                else => g_post_delay_s,
-            };
-        }
-        // An empty value is meaningful here too: it is your own Plaza.
-        if (std.mem.eql(u8, line[0..eq], "place")) applyActivePlaceLine(line[eq + 1 ..]);
-    }
 }
 
 /// Where the places you have entered are written.
@@ -43968,44 +43756,8 @@ fn loadPlaces(io: std.Io, environ: *const std.process.Environ.Map) void {
     }
 }
 
-/// Persists app-wide settings. Best-effort, like the session file.
-/// Counts what `saveSettings` was ASKED to do, before it needs a filesystem to
-/// do it. The bug it exists for is a transition that never asked at all.
-var g_settings_writes: usize = 0;
 pub fn settingsWritesForTest() usize {
-    return g_settings_writes;
-}
-
-fn saveSettings() void {
-    g_settings_writes += 1;
-    const io = g_io orelse return;
-    const environ = g_environ orelse return;
-    var dir = plazaDir(io, environ) catch return;
-    defer dir.close(io);
-    var hidden_buf: [256]u8 = undefined;
-    const hidden_ids = hiddenLine(&hidden_buf);
-    var place_buf: [160]u8 = undefined;
-    const place = activePlaceLine(&place_buf);
-    var buf: [1024]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "media_proxy={s}\nmedia_previews={s}\nclient_tag={s}\nhidden={s}\nmedia_proxy_on={s}\nmedia_direct_fallback={s}\nrail_open={s}\nplace={s}\npost_delay={d}\nhome_scope={s}\nupdate_check={s}\nshow_sensitive={s}\n", .{
-        mediaProxy(),
-        if (g_media_previews) "on" else "off",
-        if (g_client_tag) "on" else "off",
-        hidden_ids,
-        if (g_media_proxy_on) "on" else "off",
-        if (g_media_direct_fallback) "on" else "off",
-        if (g_rail_open) "on" else "off",
-        place,
-        g_post_delay_s,
-        @tagName(g_home_scope),
-        if (g_update_check) "on" else "off",
-        if (g_show_sensitive) "on" else "off",
-    }) catch return;
-    dir.writeFile(io, .{
-        .sub_path = "settings",
-        .data = data,
-        .flags = .{ .permissions = secret_file_permissions },
-    }) catch |err| std.debug.print("plaza: could not persist settings: {s}\n", .{@errorName(err)});
+    return prefs.g_settings_writes;
 }
 
 /// Where an unsent draft waits between launches. One slot, because the composer
@@ -46488,6 +46240,24 @@ pub const hiddenLine = hiding.hiddenLine;
 pub const hideables = hiding.hideables;
 pub const isTakenAway = hiding.isTakenAway;
 pub const setHidden = hiding.setHidden;
+
+// re-exports: prefs.zig
+pub const clientTag = prefs.clientTag;
+pub const client_tag_name = prefs.client_tag_name;
+pub const isMediaProxyUrl = prefs.isMediaProxyUrl;
+pub const loadSettings = prefs.loadSettings;
+pub const mediaDirectFallback = prefs.mediaDirectFallback;
+pub const mediaPreviews = prefs.mediaPreviews;
+pub const mediaProxy = prefs.mediaProxy;
+pub const mediaProxyOn = prefs.mediaProxyOn;
+pub const saveSettings = prefs.saveSettings;
+pub const setClientTag = prefs.setClientTag;
+pub const setMediaDirectFallback = prefs.setMediaDirectFallback;
+pub const setMediaPreviews = prefs.setMediaPreviews;
+pub const setMediaProxy = prefs.setMediaProxy;
+pub const setMediaProxyOn = prefs.setMediaProxyOn;
+pub const setShowSensitive = prefs.setShowSensitive;
+pub const showSensitive = prefs.showSensitive;
 
 test {
     _ = @import("tests.zig");
