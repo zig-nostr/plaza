@@ -6303,7 +6303,7 @@ test "an imported key cannot publish a profile over one nobody has read" {
     main.setIdentityMintedForTest(false);
     defer main.setIdentityMintedForTest(false);
     try testing.expect(!model.profile_can_save());
-    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "has not found your profile") != null);
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "did not find a profile for you") != null);
     try testing.expect(std.mem.indexOf(u8, model.profile_status(), "publishes your first one") == null);
 
     // A key minted in this app has no profile anywhere, which is the one case
@@ -8252,13 +8252,144 @@ test "an imported key is never assumed to follow nobody, however quiet the relay
     for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
     try testing.expect(!main.canWriteFollows());
     // And the reader is told why, rather than handed a button that does nothing.
-    try testing.expectEqualStrings("Looking for your follow list…", main.followBlockedReason().?);
+    try testing.expectEqualStrings("No follow list found on your relays", main.followBlockedReason().?);
 
     // A key minted here is the one case where "no list" is knowledge, not a
     // guess, because the key did not exist a minute ago.
     main.setIdentityMintedForTest(true);
     try testing.expect(main.canWriteFollows());
     try testing.expect(main.followBlockedReason() == null);
+}
+
+test "follow, mute and bookmark say what is wrong once the wait runs out, and can ask again" {
+    // A control that stays grey with the same sentence for the whole session is
+    // a dead end, whether the relays are slow, one of them is down or the account
+    // simply has no list. The wait is bounded, the line says how far the read got,
+    // and a retry is offered. None of it enables a write: not hearing back is not
+    // being told there is nothing.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.setIdentityForTest([_]u8{0x68} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    main.forgetOwnRecordAnswersForTest();
+    main.resetRelaysForTest();
+    main.setStoreForTest(null);
+    main.setIdentityMintedForTest(false);
+    defer main.forgetOwnRecordAnswersForTest();
+    const me = main.activePubkeyForTest().?;
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+    model.thread_root = threadNote(0xAA, 100, 0);
+    model.thread_root.id = 1;
+    model.thread_root.pubkey = [_]u8{0x55} ** 32;
+
+    // Within the wait: still reading, and nothing to press.
+    try testing.expectEqual(main.OwnListsRead.reading, main.ownListsRead());
+    try testing.expectEqualStrings("Looking for your follow list…", main.followBlockedReason().?);
+    try testing.expectEqualStrings("Looking for your mute list…", main.muteBlockedReason().?);
+    try testing.expectEqualStrings("Still fetching your bookmarks", main.bookmarkBlockedReason().?);
+
+    // The wait ran out with relays still silent: it says so, in every place, and
+    // the rows that were statements become the way to ask again.
+    main.ownListsWaitedForTest(60);
+    try testing.expectEqual(main.OwnListsRead.incomplete, main.ownListsRead());
+    try testing.expectEqualStrings("Could not read your follow list. Try again", main.followBlockedReason().?);
+    try testing.expectEqualStrings("Could not read your mute list. Try again", main.muteBlockedReason().?);
+    try testing.expectEqualStrings("Could not read your bookmarks. Try again", main.bookmarkBlockedReason().?);
+    try testing.expect(!main.canWriteFollows());
+    {
+        const p = try painted.Painted.render(arena, &model);
+        const menu = noteContext(p) orelse return error.NoContextMenu;
+        const follow = menu.label("Could not read your follow list. Try again") orelse return error.NoRetryRow;
+        try testing.expect(follow.enabled);
+        const msg = menu.msgFor(try buildTree(arena, &model), "Could not read your follow list. Try again") orelse return error.NoRetryMsg;
+        try testing.expect(msg == .retry_own_lists);
+        const mark = menu.label("Could not read your bookmarks. Try again") orelse return error.NoBookmarkRetry;
+        try testing.expect(mark.enabled);
+        // Private bookmarks have no way to ask again of their own and stay off.
+        const private = menu.label("Bookmark privately") orelse return error.NoPrivateRow;
+        try testing.expect(!private.enabled);
+    }
+
+    // The profile page: Follow and Mute stay off, and the line under the counts
+    // says how many relays finished and offers the retry.
+    var who: [32]u8 = undefined;
+    @memset(&who, 0x5e);
+    model.viewing_thread = 0;
+    model.viewing_profile = who;
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContaining(tree.root, "0 of 4 relays finished answering"));
+        try testing.expect(findAnyTextContaining(tree.root, "could not finish reading your follow and mute lists"));
+        try testing.expect(findByText(tree.root, .button, "Try again") != null);
+    }
+
+    // Asking again restarts the wait and drops the answers already counted.
+    for (0..2) |i| main.noteContactsAnsweredByForTest(i, me);
+    const gen = main.followGeneration();
+    main.retryOwnListsReadForTest();
+    try testing.expect(main.followGeneration() != gen);
+    try testing.expectEqual(main.OwnListsRead.reading, main.ownListsRead());
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContaining(tree.root, "Still reading your own follow and mute lists"));
+        try testing.expect(findByText(tree.root, .button, "Try again") == null);
+    }
+
+    // Every relay finished and none had a list: said plainly, still no write.
+    for (0..8) |i| main.noteContactsAnsweredByForTest(i, me);
+    try testing.expectEqual(main.OwnListsRead.none_found, main.ownListsRead());
+    try testing.expectEqualStrings("No follow list found on your relays", main.followBlockedReason().?);
+    try testing.expectEqualStrings("No mute list found on your relays", main.muteBlockedReason().?);
+    try testing.expectEqualStrings("No bookmark list found on your relays", main.bookmarkBlockedReason().?);
+    try testing.expect(!main.canWriteFollows());
+    {
+        const tree = try buildTree(arena, &model);
+        try testing.expect(findAnyTextContaining(tree.root, "None of your relays sent a follow and mute lists"));
+    }
+}
+
+test "the press that asks to retry reaches the relays and tells the reader" {
+    main.setIdentityForTest([_]u8{0x69} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetFollowsForTest();
+    main.forgetOwnRecordAnswersForTest();
+    defer main.forgetOwnRecordAnswersForTest();
+    var model = main.initialModel();
+    model.stage = .ready;
+    main.ownListsWaitedForTest(60);
+    try testing.expectEqual(main.OwnListsRead.incomplete, main.ownListsRead());
+    const gen = main.followGeneration();
+    var fx: main.EffectsForTest = undefined;
+    main.update(&model, .retry_own_lists, &fx);
+    try testing.expect(main.followGeneration() != gen);
+    try testing.expectEqual(main.OwnListsRead.reading, main.ownListsRead());
+    try testing.expect(model.toast_until != 0);
+}
+
+test "the profile sheet offers to ask again whenever it cannot save for want of a read" {
+    var model = main.initialModel();
+    main.setIdentityMintedForTest(false);
+    defer main.setIdentityMintedForTest(false);
+    model.profile_stage = .unread;
+    try testing.expect(model.profile_can_retry());
+    // A finished read that found nothing, for a key that was not made here: the
+    // profile may have been published since, and the sheet cannot say otherwise.
+    model.profile_stage = .absent;
+    try testing.expect(model.profile_can_retry());
+    try testing.expect(!model.profile_can_save());
+    try testing.expect(std.mem.indexOf(u8, model.profile_status(), "add that app's relays in Settings") != null);
+    model.profile_stage = .have;
+    try testing.expect(!model.profile_can_retry());
+    // Made here, absent is a fact: nothing to ask again.
+    main.setIdentityMintedForTest(true);
+    model.profile_stage = .absent;
+    try testing.expect(!model.profile_can_retry());
 }
 
 test "a write that would drop more names than the press implies is refused" {

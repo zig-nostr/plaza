@@ -12506,7 +12506,7 @@ pub const Model = struct {
         "topic_buf",                 "topic_len",              "update_check_explainer", "update_check_on",        "version_line",
         "viewingTopic",              "viewing_bookmarks",      "blossom_buffer",         "blossom_draft",          "blossom_error",
         "blossom_status",            "upload_alt",             "upload_alt_buffer",      "profile_limit",          "profile_autofill",
-        "profile_asked_until",       "relay_last",
+        "profile_asked_until",       "relay_last",             "profile_can_retry",
     };
 
     /// Why the join sheet is up, in the reader's own terms. Empty when they
@@ -12785,7 +12785,7 @@ pub const Model = struct {
             .absent => if (g_identity_minted_here)
                 "You have no profile yet. Saving publishes your first one."
             else
-                "Plaza has not found your profile on the relays it can reach. It will not publish over one it has not read.",
+                "Plaza did not find a profile for you on the relays it reads, and it will not publish over one it has not seen. If you have one in another app, add that app's relays in Settings and try again.",
             // Deliberately NOT "you have no profile". Not hearing back is not
             // the same as being told there is nothing, and only one of those is
             // safe to publish over.
@@ -12850,6 +12850,16 @@ pub const Model = struct {
     }
 
     /// Saving is refused until the app HAS the profile it would be merging into.
+    /// Whether asking the relays again can change what the sheet says: a read
+    /// that did not finish, or one that finished empty for a key that was not
+    /// made here (the profile may have been published since).
+    pub fn profile_can_retry(self: *const Model) bool {
+        return switch (self.profile_stage) {
+            .unread => true,
+            .absent => !g_identity_minted_here,
+            else => false,
+        };
+    }
     /// Publishing a merge of nothing is how a lightning address disappears.
     ///
     /// `.absent` is the case that needed the argument. It means "a relay
@@ -18112,6 +18122,9 @@ pub const Msg = union(enum) {
     profile_nip05_edit: canvas.TextInputEvent,
     profile_save,
     profile_retry,
+    /// Ask the relays again for the reader's own follow, mute and bookmark
+    /// lists, after the first ask went unanswered.
+    retry_own_lists,
     /// Walks a relay through what it is for: both, read, write.
     relay_cycle: u8,
     /// The notice's answer for relay slot N: identify to it.
@@ -18441,6 +18454,7 @@ pub const Msg = union(enum) {
         "profile_nip05_edit",
         "profile_website_edit",
         "profile_retry",
+        "retry_own_lists",
         "profile_save",
         "profile_tab",
         "proxy_edit",
@@ -19614,11 +19628,11 @@ fn profileSheet(ui: *AppUi, model: *const Model) AppUi.Node {
             ui.row(.{ .gap = 8, .cross = .center }, .{
                 ui.button(.{ .size = .sm, .variant = .ghost, .autofocus = true, .on_press = Msg.close_profile_edit }, "Close"),
                 ui.spacer(1),
-                if (model.profile_stage == .unread)
+                if (model.profile_can_retry())
                     ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.profile_retry }, "Try again")
                 else
                     ui.spacer(0),
-                if (model.profile_stage == .unread) hgap(ui, 8) else ui.spacer(0),
+                if (model.profile_can_retry()) hgap(ui, 8) else ui.spacer(0),
                 ui.button(.{
                     .size = .sm,
                     .variant = .primary,
@@ -23544,7 +23558,7 @@ fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8) vo
     const base_tags: []const nostr.event.Tag = if (previous) |prev| prev.tags else &.{};
     const base_created_at: i64 = if (previous) |prev| prev.created_at else 0;
     if (previous == null and !g_identity_minted_here) {
-        setToast(model, "Still fetching your bookmarks. Try again in a moment.");
+        setToast(model, noListToast("bookmarks"));
         return;
     }
 
@@ -24658,6 +24672,9 @@ fn forgetFollows() void {
     // behind, it would be the base the NEXT account's first follow builds on.
     clearPendingFollowBase();
     forgetOwnListMemo();
+    // And how long it has been waiting on this account's lists: the next one
+    // starts its own clock.
+    g_own_lists_since_for = null;
     // The open subscriptions were built for the previous identity and are now
     // asking the wrong question. Without this a sign-in never gets its own
     // records requested on an already-open socket, and following stays disabled
@@ -24724,7 +24741,11 @@ pub fn canWriteFollows() bool {
 pub fn followBlockedReason() ?[]const u8 {
     if (activePubkey() == null) return null;
     if (canWriteFollows()) return null;
-    return "Looking for your follow list…";
+    return switch (ownListsRead()) {
+        .reading => "Looking for your follow list…",
+        .incomplete => "Could not read your follow list. Try again",
+        .none_found => "No follow list found on your relays",
+    };
 }
 
 /// Why muting is unavailable right now, in the words the button shows under it.
@@ -24743,7 +24764,24 @@ pub fn muteBlockedReason() ?[]const u8 {
     // paid for (deciding a write from a SECOND query let a transient failure
     // answer "they have no list").
     if (mutesAreOwned()) return null;
-    return "Looking for your mute list…";
+    return switch (ownListsRead()) {
+        .reading => "Looking for your mute list…",
+        .incomplete => "Could not read your mute list. Try again",
+        .none_found => "No mute list found on your relays",
+    };
+}
+
+/// Why the bookmark rows are unavailable, in the words the row shows, or null
+/// when the list is read (or provably empty). Same rule as the mute list.
+pub fn bookmarkBlockedReason() ?[]const u8 {
+    if (activePubkey() == null) return null;
+    if (g_identity_minted_here) return null;
+    if (bookmarksAreOwned()) return null;
+    return switch (ownListsRead()) {
+        .reading => "Still fetching your bookmarks",
+        .incomplete => "Could not read your bookmarks. Try again",
+        .none_found => "No bookmark list found on your relays",
+    };
 }
 
 /// Whether this account's own kind:3 is in the local store, REMEMBERED.
@@ -24810,20 +24848,102 @@ pub fn forgetOwnListMemoForTest() void {
 /// create: see `canWriteFollows`.
 fn contactsConfirmedAbsent() bool {
     const pk = activePubkey() orelse return false;
+    const counts = relayAnswers(pk);
+    if (counts.readable == 0 or counts.answered == 0) return false;
+    return counts.answered >= counts.readable;
+}
+
+/// How many of the relays this reader reads from have finished answering about
+/// their own records, and how many there are.
+const RelayAnswers = struct { answered: usize, readable: usize };
+
+fn relayAnswers(pk: [32]u8) RelayAnswers {
     lockOwnProfile();
     defer unlockOwnProfile();
-    const asked = g_own_contacts_asked_for orelse return false;
-    if (!std.mem.eql(u8, &asked, &pk)) return false;
-    var answered: usize = 0;
-    var readable: usize = 0;
+    const mine = if (g_own_contacts_asked_for) |asked| std.mem.eql(u8, &asked, &pk) else false;
+    var out = RelayAnswers{ .answered = 0, .readable = 0 };
     for (0..relaySlots()) |i| {
         const e = relayAt(i) orelse continue;
         if (!e.read) continue;
-        readable += 1;
-        if (g_contacts_answered_by[i]) answered += 1;
+        out.readable += 1;
+        if (mine and g_contacts_answered_by[i]) out.answered += 1;
     }
-    if (readable == 0 or answered == 0) return false;
-    return answered >= readable;
+    return out;
+}
+
+/// How long Plaza keeps saying it is reading the reader's own lists before it
+/// says it could not. A relay can accept the subscription and then never finish
+/// it, and "reading" with no end is a state the reader cannot do anything about.
+const own_lists_wait_s: i64 = 15;
+
+/// Where the read of this account's own follow, mute and bookmark lists stands
+/// when the list is not in the local store. One REQ asks every relay for all of
+/// them, so one answer from a relay covers all three.
+pub const OwnListsRead = enum {
+    /// Relays are still answering and the wait has not run out.
+    reading,
+    /// The wait ran out and some relay has not finished. Not hearing back is not
+    /// the same as being told there is nothing, so nothing is written.
+    incomplete,
+    /// Every relay this reader reads from has finished and none sent the list.
+    none_found,
+};
+
+var g_own_lists_since: i64 = 0;
+var g_own_lists_since_for: ?[32]u8 = null;
+
+/// Read from view code. The clock starts the first time this account asks, so
+/// there is no sign-in path that has to remember to start it.
+pub fn ownListsRead() OwnListsRead {
+    const pk = activePubkey() orelse return .reading;
+    if (contactsConfirmedAbsent()) return .none_found;
+    const now = nowSeconds();
+    if (g_own_lists_since_for) |who| {
+        if (!std.mem.eql(u8, &who, &pk)) g_own_lists_since_for = null;
+    }
+    if (g_own_lists_since_for == null) {
+        g_own_lists_since = now;
+        g_own_lists_since_for = pk;
+    }
+    return if (now - g_own_lists_since >= own_lists_wait_s) .incomplete else .reading;
+}
+
+/// Asks every relay again what it holds for this reader. The answers already
+/// counted are dropped first: they were about the question as it stood, and a
+/// retry that kept them would report "done" without having heard anything new.
+fn retryOwnListsRead() void {
+    const pk = activePubkey() orelse return;
+    {
+        lockOwnProfile();
+        defer unlockOwnProfile();
+        g_own_contacts_asked_for = pk;
+        g_contacts_answered_by = [_]bool{false} ** max_relays;
+    }
+    g_own_lists_since = nowSeconds();
+    g_own_lists_since_for = pk;
+    // The open subscriptions re-ask on this counter, which is what makes every
+    // relay send its stored answer (and its end-of-stored-events) again.
+    _ = g_follow_gen.fetchAdd(1, .monotonic);
+}
+
+pub fn retryOwnListsReadForTest() void {
+    retryOwnListsRead();
+}
+
+/// Pretends the wait has run for `seconds`, for a test that cannot sleep.
+pub fn ownListsWaitedForTest(seconds: i64) void {
+    const pk = activePubkey() orelse return;
+    g_own_lists_since = nowSeconds() - seconds;
+    g_own_lists_since_for = pk;
+}
+
+/// Says how far the read got, in the reader's terms: how many of the relays
+/// they read from have finished. For the line under a control that is waiting.
+fn ownListsProgress(ui: *AppUi) []const u8 {
+    const pk = activePubkey() orelse return "";
+    const counts = relayAnswers(pk);
+    if (counts.readable == 0) return "No relay is set to read from.";
+    return ui.fmt("{d} of {d} {s} finished answering.", .{ counts.answered, counts.readable, if (counts.readable == 1) "relay" else "relays" });
 }
 
 /// Which relays have answered about this account's contact list.
@@ -26922,21 +27042,50 @@ fn profileCard(ui: *AppUi, model: *const Model, pubkey: [32]u8) AppUi.Node {
                 if (website.len > 0) profileLinks(ui, website) else ui.spacer(0),
                 vgap(ui, 9),
                 profileCounts(ui, pubkey, is_me),
-                if (!is_me and followBlockedReason() != null)
-                    ui.column(.{ .gap = 0 }, .{
-                        vgap(ui, 7),
-                        ui.paragraph(
-                            .{ .wrap = true, .style = .{ .foreground = p.text_dim } },
-                            &.{.{ .text = "Still reading your own follow list. Following is off until it arrives, because writing before then would replace it.", .scale = mono_hint_scale }},
-                        ),
-                    })
-                else
-                    ui.spacer(0),
+                if (!is_me) ownListsHint(ui) else ui.spacer(0),
                 vgap(ui, 14),
                 profileTabs(ui, model),
             }),
             hgap(ui, 20),
         }),
+    });
+}
+
+/// The line under a profile's counts when Follow or Mute is off because the
+/// reader's own list has not been read. It says which list, how far the read got
+/// and, once the wait ran out, offers to ask again: a greyed button with a
+/// sentence that never changes is a dead end.
+fn ownListsHint(ui: *AppUi) AppUi.Node {
+    const p = theme.palette;
+    const follow_off = followBlockedReason() != null;
+    const mute_off = muteBlockedReason() != null;
+    if (!follow_off and !mute_off) return ui.spacer(0);
+    const state = ownListsRead();
+    const both = follow_off and mute_off;
+    const lists = if (both) "follow and mute lists" else if (follow_off) "follow list" else "mute list";
+    const what = if (both) "Following and muting are" else if (follow_off) "Following is" else "Muting is";
+    const text = switch (state) {
+        .reading => ui.fmt("Still reading your own {s}. {s} off until {s}, because writing before then would replace {s}.", .{
+            lists, what, if (both) "they arrive" else "it arrives", if (both) "them" else "it",
+        }),
+        .incomplete => ui.fmt("{s} Plaza could not finish reading your {s}. {s} off rather than replace a list it has not seen. A relay that is down can be removed in Settings.", .{
+            ownListsProgress(ui), lists, what,
+        }),
+        .none_found => ui.fmt("None of your relays sent a {s}. {s} off, because a list kept somewhere Plaza has not looked would be replaced.", .{ lists, what }),
+    };
+    return ui.column(.{ .gap = 0 }, .{
+        vgap(ui, 7),
+        ui.paragraph(
+            .{ .wrap = true, .style = .{ .foreground = p.text_dim } },
+            &.{.{ .text = text, .scale = mono_hint_scale }},
+        ),
+        if (state == .incomplete)
+            ui.column(.{ .gap = 0 }, .{
+                vgap(ui, 6),
+                ui.row(.{ .gap = 0 }, .{ui.button(.{ .size = .sm, .variant = .ghost, .on_press = Msg.retry_own_lists }, "Try again")}),
+            })
+        else
+            ui.spacer(0),
     });
 }
 
@@ -28973,9 +29122,7 @@ fn noteContextItems(ui: *AppUi, note: *const Note, in_thread: bool) []const AppU
 /// of one note over everything they had saved.
 fn bookmarkContextItem(note: *const Note) AppUi.ContextMenuItem {
     if (activePubkey() == null) return .{ .label = "Bookmark", .enabled = false };
-    if (!bookmarksAreOwned() and !g_identity_minted_here) {
-        return .{ .label = "Still fetching your bookmarks", .enabled = false };
-    }
+    if (bookmarkBlockedReason()) |reason| return blockedListItem(reason);
     if (isBookmarked(note.event_id)) {
         return .{ .label = "Remove bookmark", .msg = Msg{ .toggle_bookmark = note.id } };
     }
@@ -28993,9 +29140,7 @@ fn bookmarkContextItem(note: *const Note) AppUi.ContextMenuItem {
 /// halves, and that is a different feature.
 fn privateBookmarkContextItem(note: *const Note) AppUi.ContextMenuItem {
     if (activePubkey() == null) return .{ .label = "Bookmark privately", .enabled = false };
-    if (!bookmarksAreOwned() and !g_identity_minted_here) {
-        return .{ .label = "Bookmark privately", .enabled = false };
-    }
+    if (bookmarkBlockedReason() != null) return .{ .label = "Bookmark privately", .enabled = false };
     if (isBookmarked(note.event_id)) return .{ .label = "Bookmark privately", .enabled = false };
     return .{ .label = "Bookmark privately", .msg = Msg{ .bookmark_privately = note.id } };
 }
@@ -29007,6 +29152,14 @@ fn privateBookmarkContextItem(note: *const Note) AppUi.ContextMenuItem {
 fn isMine(author: [32]u8) bool {
     const me = activePubkey() orelse return false;
     return std.mem.eql(u8, &me, &author);
+}
+
+/// A menu row for a list that cannot be written yet. While Plaza is still
+/// reading it is a statement; once the wait ran out the same row is the way to
+/// ask the relays again, so the reader is never left with a dead row.
+fn blockedListItem(reason: []const u8) AppUi.ContextMenuItem {
+    if (ownListsRead() == .incomplete) return .{ .label = reason, .msg = Msg.retry_own_lists };
+    return .{ .label = reason, .enabled = false };
 }
 
 /// The follow entry for a right-click, in whatever state it is honestly in.
@@ -29021,7 +29174,7 @@ fn followContextItem(author: [32]u8) AppUi.ContextMenuItem {
     if (me) |pk| {
         if (std.mem.eql(u8, &pk, &author)) return .{ .label = "This is you", .enabled = false };
     } else return .{ .label = "Follow", .msg = Msg{ .follow_author = .{ .who = author, .direction = 0 } } };
-    if (followBlockedReason()) |reason| return .{ .label = reason, .enabled = false };
+    if (followBlockedReason()) |reason| return blockedListItem(reason);
     if (isFollowedByMe(author)) return .{ .label = "Unfollow", .msg = Msg{ .follow_author = .{ .who = author, .direction = 2 } } };
     return .{ .label = "Follow", .msg = Msg{ .follow_author = .{ .who = author, .direction = 1 } } };
 }
@@ -34114,6 +34267,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // Their published relay list, taken on this thread so no ingest
                 // thread ever swaps the pool out from under the others.
                 _ = adoptRelayList();
+                // Starts the clock on reading the reader's own lists at sign-in
+                // rather than the first time a control asks about them.
+                if (activePubkey() != null) _ = ownListsRead();
                 flushRelayList(fx, now);
                 // At most one write a second, and only when something changed.
                 if (inboxNeedsSave()) saveInbox();
@@ -34429,6 +34585,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .profile_save => {
             g_profile_upload_unsaved = false;
             saveProfile(model, fx);
+        },
+        .retry_own_lists => {
+            retryOwnListsRead();
+            setToast(model, "Asking your relays again.");
         },
         .profile_retry => {
             forgetOwnProfileAnswer();
@@ -35194,7 +35354,7 @@ fn sayFollowWrite(model: *Model, outcome: FollowWrite, following: bool) void {
         // Nothing changed because nothing needed to. Saying so would be noise.
         .nothing_to_do => {},
         .signer_busy => setToast(model, "Your signer is busy. Try that again in a moment."),
-        .no_list_yet => setToast(model, "Still fetching your follow list. Try again in a moment."),
+        .no_list_yet => setToast(model, noListToast("follow list")),
         // The guard fired, which means the list this app was about to publish
         // was not the list it meant to. Saying "try again" would be wrong: the
         // right move is to leave it alone until the real list is back.
@@ -35209,7 +35369,7 @@ fn sayBookmarkWrite(model: *Model, outcome: BookmarkWrite, adding: bool) void {
         .published => setToast(model, if (adding) "Bookmarked" else "Bookmark removed"),
         .nothing_to_do => {},
         .signer_busy => setToast(model, "Your signer is busy. Try that again in a moment."),
-        .no_list_yet => setToast(model, "Still fetching your bookmarks. Try again in a moment."),
+        .no_list_yet => setToast(model, noListToast("bookmarks")),
         // Waiting is a delay and says so. Declined has already asked again on
         // this press, so it says where to approve it. Unreadable is a limit, so
         // it does not say "try again": the right move is to leave the list
@@ -35229,7 +35389,7 @@ fn sayMuteWrite(model: *Model, outcome: MuteWrite, muting: bool) void {
         .published => setToast(model, if (muting) "Muted" else "Unmuted"),
         .nothing_to_do => {},
         .signer_busy => setToast(model, "Your signer is busy. Try that again in a moment."),
-        .no_list_yet => setToast(model, "Still fetching your mute list. Try again in a moment."),
+        .no_list_yet => setToast(model, noListToast("mute list")),
         // Waiting is a delay and says so. Declined has already asked again on
         // this press, so it says where to approve it. Unreadable is the one
         // message about a limit rather than a delay, so it does not say "try again":
@@ -35266,6 +35426,17 @@ var g_last_clipboard: [note_address_cap]u8 = undefined;
 var g_last_clipboard_len: usize = 0;
 pub fn lastClipboardForTest() []const u8 {
     return g_last_clipboard[0..g_last_clipboard_len];
+}
+
+/// What a refused list write says, by how far the read of that list got. The
+/// refusal is the same every time (nothing was changed); what the reader can do
+/// about it is not.
+fn noListToast(comptime what: []const u8) []const u8 {
+    return switch (ownListsRead()) {
+        .reading => "Still fetching your " ++ what ++ ". Try again in a moment.",
+        .incomplete => "Could not read your " ++ what ++ " from your relays, so nothing was changed.",
+        .none_found => "No " ++ what ++ " was found on your relays, so nothing was changed.",
+    };
 }
 
 fn setToast(model: *Model, text: []const u8) void {
@@ -35392,6 +35563,7 @@ fn forgetOwnRecordAnswers() void {
     // inherit the previous one's answers and reach the write gate without any
     // relay having said a word about them.
     g_contacts_answered_by = [_]bool{false} ** max_relays;
+    g_own_lists_since_for = null;
 }
 var g_own_profile_asking = std.atomic.Value(bool).init(false);
 /// Set by the worker when at least one relay ANSWERED (EOSE), paired with the
@@ -38873,7 +39045,7 @@ fn drivePendingIntent(model: *Model, fx: *Effects) void {
             // than queued, because a write that lands minutes later, silently, is
             // exactly the shape this app refuses everywhere else.
             if (!canWriteFollows()) {
-                setToast(model, "Still fetching your follow list. Try again in a moment.");
+                setToast(model, noListToast("follow list"));
                 return;
             }
             sayFollowWrite(model, writeFollow(fx, pk, true), true);
