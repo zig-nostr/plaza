@@ -248,3 +248,66 @@ test "a private bookmark is sealed, written and read back" {
     try testing.expect(main.isBookmarked(secret_one));
     try testing.expect(main.isBookmarked(public_one));
 }
+
+test "a private bookmark sealed while Notary signs a like is not sent, and says so" {
+    // The press asked whether the signer was free, and then the seal took a
+    // round trip. A like pressed in between held Notary's one key, the
+    // bookmark's sign took the like's slot and its undo, the SDK refused the
+    // second sign, and the toast said "Bookmarked privately" anyway.
+    defer main.resetOutboxForTest();
+    main.forgetBookmarksForTest();
+    defer {
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+        main.releaseHelperSignForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bmbusy.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    _ = try bookmarkFixture(arena, &signer, &store, &.{}, "");
+    const secret_one = [_]u8{0xb7} ** 32;
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    // What an earlier test published and no tick said.
+    main.sayPrivateBookmarkPublished(&model);
+    model.toast_len = 0;
+
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, secret_one, true));
+    // A like goes out to Notary while the seal is away.
+    main.holdHelperSignForTest();
+    main.finishPrivateBookmarkForTest(&model, &fx);
+    try testing.expectEqualStrings("Your signer is busy. Nothing was sent.", model.toast_text());
+    try testing.expect(!main.isBookmarked(secret_one));
+    try testing.expect(main.helperSignPendingForTest());
+
+    // Free again, and handed to a signer that has not answered yet: nothing
+    // is published, so nothing is said.
+    main.releaseHelperSignForTest();
+    model.toast_len = 0;
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, secret_one, true));
+    main.silenceTestSignerForTest(true);
+    main.finishPrivateBookmarkForTest(&model, &fx);
+    main.silenceTestSignerForTest(false);
+    main.sayPrivateBookmarkPublished(&model);
+    try testing.expectEqual(@as(usize, 0), model.toast_len);
+
+    // And one that is signed and published says so, on the tick.
+    main.releaseHelperSignForTest();
+    const secret_two = [_]u8{0xb8} ** 32;
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, secret_two, true));
+    main.finishPrivateBookmarkForTest(&model, &fx);
+    try testing.expect(main.isBookmarked(secret_two));
+    try testing.expectEqual(@as(usize, 0), model.toast_len);
+    main.sayPrivateBookmarkPublished(&model);
+    try testing.expectEqualStrings("Bookmarked privately", model.toast_text());
+}

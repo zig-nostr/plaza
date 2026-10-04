@@ -18,6 +18,7 @@ const geometry = native_sdk.geometry;
 
 // ---- from main.zig
 const noteOwnWriteUnstored = main.noteOwnWriteUnstored;
+const notePrivateBookmarkPublished = main.notePrivateBookmarkPublished;
 const postWaitsForPicture = main.postWaitsForPicture;
 const AppUi = main.AppUi;
 const Effects = main.Effects;
@@ -1384,6 +1385,7 @@ pub fn ingestAndPublish(gpa: std.mem.Allocator, ev: nostr.event.Event, verify: ?
         // have before.
         _ = enqueueOutbox(ev.id, ev.pubkey, nowSeconds(), route);
     }
+    notePrivateBookmarkPublished(ev);
     // A test drives the write path, not the network. Its pool names hosts that
     // do not resolve, and a detached dial thread for one of those outlives the
     // test that started it and can take the process down on the way out, which

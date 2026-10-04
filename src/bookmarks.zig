@@ -438,6 +438,14 @@ pub fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8
     // Sealed for the account that pressed, and published only as that account.
     const me = activePubkey() orelse return;
     if (!std.mem.eql(u8, &me, &seal.account)) return;
+    // Asked again here, because the press asked before the seal's round trip.
+    // Notary signs one thing at a time, and a like pressed while this was being
+    // sealed holds its one key: signing this too took the like's slot and its
+    // undo, and the SDK refused this sign, so nothing was published.
+    if (!signerReady()) {
+        setToast(model, "Your signer is busy. Nothing was sent.");
+        return;
+    }
     // What came back is checked before it becomes the list's content. A
     // ciphertext of any other length than this plaintext seals to was cut or
     // mangled on the way, and publishing it would replace every private
@@ -518,8 +526,43 @@ pub fn finishPrivateBookmark(model: *Model, fx: *Effects, ciphertext: []const u8
     }
     setBookmarks(next[0..n], created);
 
+    // Said when it is published (see `notePrivateBookmarkPublished`), not when
+    // it is handed to the signer.
+    g_private_announce_adding = seal.adding;
+    g_private_announce_account = me;
+    g_private_announce_at.store(created, .release);
     signAndPublish(fx, gpa, created, bookmark_list_kind, owned_tags, content, false, .none, null);
-    setToast(model, if (seal.adding) "Bookmarked privately" else "Bookmark removed");
+}
+
+/// The stamp of the private bookmark write out with the signer, and whether it
+/// adds, so the reader is told it happened when it is published. The publish
+/// can land on the bunker listener's thread, so the stamp is atomic, and the
+/// other two are written before it.
+var g_private_announce_at = std.atomic.Value(i64).init(0);
+var g_private_announce_adding: bool = false;
+var g_private_announce_account: [32]u8 = undefined;
+/// 0 nothing to say, 1 bookmarked, 2 removed. Set where it is published, said
+/// on the tick.
+var g_private_announced = std.atomic.Value(u8).init(0);
+
+/// The publish path's half: `ev` is going out, and if it is the private
+/// bookmark write, the tick says so.
+pub fn notePrivateBookmarkPublished(ev: nostr.event.Event) void {
+    if (ev.kind != bookmark_list_kind) return;
+    const at = g_private_announce_at.load(.acquire);
+    if (at == 0 or at != ev.created_at) return;
+    if (!std.mem.eql(u8, &ev.pubkey, &g_private_announce_account)) return;
+    if (g_private_announce_at.cmpxchgStrong(at, 0, .acq_rel, .acquire) != null) return;
+    g_private_announced.store(if (g_private_announce_adding) 1 else 2, .release);
+}
+
+/// The tick's half.
+pub fn sayPrivateBookmarkPublished(model: *Model) void {
+    switch (g_private_announced.swap(0, .acq_rel)) {
+        1 => setToast(model, "Bookmarked privately"),
+        2 => setToast(model, "Bookmark removed"),
+        else => {},
+    }
 }
 pub var g_test_sealed: [max_private_cipher_len]u8 = undefined;
 pub var g_test_sealed_len: usize = 0;

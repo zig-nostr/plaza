@@ -3585,6 +3585,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 // The same question for the built-in signer, which had no
                 // answer to it at all: a sign that failed simply ended.
                 if (keyholder.g_signer_kind == .helper) scanHelperSign(model);
+                sayPrivateBookmarkPublished(model);
                 // A record of the reader's own that went out and did not reach
                 // the store, offered to it again.
                 retryUnstoredOwnWrites(model, now);
@@ -4007,7 +4008,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             const note = model.noteById(note_id) orelse return;
             if (askFreshFirst(model, .{ .action = .bookmark_privately, .note_id = note_id })) return;
             // A seal is a round trip, so nothing is said until it lands: the
-            // toast comes from `finishPrivateBookmark`, or from the refusal.
+            // toast comes when the list is published (see
+            // `sayPrivateBookmarkPublished`), or from the refusal.
             switch (writePrivateBookmark(fx, note.event_id, true)) {
                 .published => {},
                 else => |outcome| sayBookmarkWrite(model, outcome, true),
@@ -6304,6 +6306,8 @@ pub const unlockMutes = mutes.unlockMutes;
 pub const writeMute = mutes.writeMute;
 
 // re-exports: bookmarks.zig
+pub const notePrivateBookmarkPublished = bookmarks.notePrivateBookmarkPublished;
+pub const sayPrivateBookmarkPublished = bookmarks.sayPrivateBookmarkPublished;
 pub const parkSealAnswerForTest = bookmarks.parkSealAnswerForTest;
 pub const lastSealPlaintextForTest = bookmarks.lastSealPlaintextForTest;
 pub const finishPrivateBookmarkForTest = bookmarks.finishPrivateBookmarkForTest;
