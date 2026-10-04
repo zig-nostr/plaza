@@ -7,6 +7,7 @@ const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
 const hiding = @import("hiding.zig");
+const updates = @import("updates.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -178,7 +179,7 @@ pub fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
     g_media_previews = true;
     g_show_sensitive = false;
     g_client_tag = false;
-    main.g_update_check = true;
+    updates.g_update_check = true;
     g_media_proxy_on = true;
     g_media_direct_fallback = true;
     hiding.g_hidden = @splat(false);
@@ -203,7 +204,7 @@ pub fn loadSettings(io: std.Io, environ: *const std.process.Environ.Map) void {
         if (std.mem.eql(u8, line[0..eq], "media_previews")) g_media_previews = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "show_sensitive")) g_show_sensitive = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "client_tag")) g_client_tag = std.mem.eql(u8, line[eq + 1 ..], "on");
-        if (std.mem.eql(u8, line[0..eq], "update_check")) main.g_update_check = std.mem.eql(u8, line[eq + 1 ..], "on");
+        if (std.mem.eql(u8, line[0..eq], "update_check")) updates.g_update_check = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "media_proxy_on")) g_media_proxy_on = std.mem.eql(u8, line[eq + 1 ..], "on");
         if (std.mem.eql(u8, line[0..eq], "media_direct_fallback")) g_media_direct_fallback = std.mem.eql(u8, line[eq + 1 ..], "on");
         // Written by id rather than by position, so adding an element to the
@@ -257,7 +258,7 @@ pub fn saveSettings() void {
         place,
         main.g_post_delay_s,
         @tagName(main.g_home_scope),
-        if (main.g_update_check) "on" else "off",
+        if (updates.g_update_check) "on" else "off",
         if (g_show_sensitive) "on" else "off",
     }) catch return;
     dir.writeFile(io, .{
