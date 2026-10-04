@@ -180,6 +180,53 @@ test "a remembered follow is never written over a contact list nobody has read" 
     try testing.expect(!model.pending.waiting());
     try testing.expect(model.toast_until != 0);
 }
+test "a busy signer is named as any signer by Post, and said by Delete" {
+    // Post blamed Notary for a bunker with every slot taken, and Delete closed
+    // its confirm on nothing.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const mine = try signer.keyPairFromSecretKey([_]u8{33} ** 32);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/busy.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    main.setStoreForTest(&store);
+    defer main.setStoreForTest(null);
+    main.setIdentityForTest([_]u8{33} ** 32);
+    defer main.clearIdentityForTest();
+    main.forgetLastPublishedForTest();
+    defer main.forgetLastPublishedForTest();
+    const my_note = try nostr.event.create(arena, signer, mine, 1_800_000_000, 1, &.{}, "mine", null);
+    _ = try main.plazaIngestForTest(arena, my_note);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = main.Note{ .created_at = 1_800_000_000 };
+    model.notes[0].id = 1;
+    model.notes[0].event_id = my_note.id;
+    model.notes[0].pubkey = mine.public_key;
+    model.notes_len = 1;
+    var fx: main.EffectsForTest = undefined;
+
+    main.holdHelperSignForTest();
+    defer main.releaseHelperSignForTest();
+    model.composing = true;
+    model.draft_buffer.set("a note");
+    try testing.expect(!main.firePost(&model, &fx, null));
+    try testing.expectEqualStrings(main.signer_busy_toast, model.toast_text());
+    try testing.expectEqualStrings("a note", model.draft());
+
+    model.toast_len = 0;
+    main.deleteNote(&model, &fx, 1);
+    try testing.expectEqualStrings(main.signer_busy_toast, model.toast_text());
+    try testing.expect(main.lastPublishedForTest() == null);
+}
+
 test "delete is offered on my own note and refuses anything but a kind 1 of mine" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

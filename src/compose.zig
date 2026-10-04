@@ -95,6 +95,13 @@ const writeFollow = main.writeFollow;
 /// belongs where it was written.
 pub var g_held_route: PlaceRoute = .none;
 
+/// What a press is told when the signer cannot take it now. Any signer: Notary
+/// with a sign out, or a bunker with every request slot taken.
+pub const signer_busy_toast = "Your signer is busy for a moment. Try again.";
+comptime {
+    std.debug.assert(signer_busy_toast.len <= 48);
+}
+
 pub fn firePost(model: *Model, fx: *Effects, route: ?PlaceRoute) bool {
     g_post_due_s = 0;
     // A picture chosen during the pause is on its way into this note. The
@@ -108,7 +115,7 @@ pub fn firePost(model: *Model, fx: *Effects, route: ?PlaceRoute) bool {
         setToast(model, if (!outboxHasRoom())
             "Still sending your last notes. This one is kept."
         else
-            "Notary is busy for a moment. Try again.");
+            signer_busy_toast);
         return false;
     }
     // The slot is emptied the moment its contents go to a signer. Leaving it
@@ -1214,7 +1221,8 @@ fn unlike(fx: *Effects, note_id: i64) void {
 /// back. Amethyst does delete lists this way. This will not.
 pub fn deleteNote(model: *Model, fx: *Effects, note_id: i64) void {
     const target = deletableTarget(model, note_id) orelse return;
-    if (!signerReady()) return;
+    // Said, rather than the confirm closing on nothing.
+    if (!signerReady()) return setToast(model, signer_busy_toast);
     const gpa = std.heap.page_allocator;
     const tags = buildDeleteTags(gpa, target.event_id, target.kind) orelse return;
     const content = gpa.dupe(u8, "") catch return;

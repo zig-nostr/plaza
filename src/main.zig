@@ -6755,6 +6755,7 @@ pub const deleteNote = compose.deleteNote;
 pub const drivePendingIntent = compose.drivePendingIntent;
 pub const dupeTags = compose.dupeTags;
 pub const firePost = compose.firePost;
+pub const signer_busy_toast = compose.signer_busy_toast;
 pub const fireReply = compose.fireReply;
 pub const hexAlloc = compose.hexAlloc;
 pub const ingestAndPublish = compose.ingestAndPublish;
