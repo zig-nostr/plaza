@@ -7,6 +7,7 @@ const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
 const relay_table = @import("relay_table.zig");
+const routing = @import("routing.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -244,8 +245,8 @@ pub fn ingestRelayList(ev: nostr.event.Event) void {
     //
     // Stamped as well as flagged, because a cold start lands hundreds of these
     // in a few seconds and the ranking is worth doing once they have stopped.
-    if (nowMillis()) |ms| main.g_route_list_at.store(ms, .release);
-    main.g_relay_ranks_dirty.store(true, .release);
+    if (nowMillis()) |ms| routing.g_route_list_at.store(ms, .release);
+    routing.g_relay_ranks_dirty.store(true, .release);
 }
 
 /// An edit is waiting to be published, and when it was made. Walking a badge
