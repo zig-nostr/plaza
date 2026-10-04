@@ -44,7 +44,7 @@ const loadBookmarksFromStore = main.loadBookmarksFromStore;
 const loadMutesFromStore = main.loadMutesFromStore;
 const networkAllowed = main.networkAllowed;
 const nowSeconds = main.nowSeconds;
-const offerLiveRelay = main.offerLiveRelay;
+const offerBunkerListener = main.offerBunkerListener;
 const one_shot_budget_ms = main.one_shot_budget_ms;
 const parkUploadSign = main.parkUploadSign;
 const persistSession = main.persistSession;
@@ -847,11 +847,11 @@ fn nip46ReceiveOnce(gpa: std.mem.Allocator, io: std.Io, signer: nostr.keys.Signe
     // runs before it. Only this listener's own registration: a newer one may
     // hold the slot by now.
     defer relay.deinit();
-    offerLiveRelay(bunker_watch_slot, relay);
+    // Refused when this listener's pairing has ended: a pairing ended before
+    // the offer bumped the generation already, and one ended after it finds
+    // this socket to take down.
+    if (!offerBunkerListener(relay, generation)) return;
     defer withdrawLiveRelay(bunker_watch_slot, relay);
-    // Offered first, then checked: a pairing ended before the offer bumped the
-    // generation already, and one ended after it finds this socket to take down.
-    if (generation != g_remote_generation.load(.acquire)) return;
 
     var client_hex: [64]u8 = undefined;
     hexLower(&client_hex, client_kp.public_key);

@@ -7,6 +7,7 @@ const nostr = @import("nostr");
 const theme = @import("theme.zig");
 const main = @import("main.zig");
 const outbox = @import("outbox.zig");
+const remote_signer = @import("remote_signer.zig");
 
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
@@ -137,6 +138,23 @@ pub fn offerLiveRelay(index: usize, relay: ?*nostr.relay.Relay) void {
     g_relay_pinged_ms[index] = 0;
 }
 
+/// Offers the bunker listener's connection for `generation`, or refuses it when
+/// that pairing has already ended. The check and the store are one step under
+/// the slot's lock, the lock `takeDownBunkerListener` takes after the
+/// generation moves: an offer made before the move is found and taken down, and
+/// one made after it is refused. Checked apart, a listener still dialling for an
+/// ended pairing could store its socket over the new listener's and then
+/// withdraw it, leaving the live pairing unwatched and out of reach of the
+/// sign-out that should take it down.
+pub fn offerBunkerListener(relay: *nostr.relay.Relay, generation: u64) bool {
+    lockLiveRelay(bunker_watch_slot);
+    defer unlockLiveRelay(bunker_watch_slot);
+    if (generation != remote_signer.g_remote_generation.load(.acquire)) return false;
+    g_relay_live[bunker_watch_slot] = relay;
+    g_relay_pinged_ms[bunker_watch_slot] = 0;
+    return true;
+}
+
 /// Withdraws `relay` from slot `index`, and only `relay`. The bunker's slot
 /// changes hands when a new link is pasted while the old listener is still
 /// unwinding, and a blind withdraw from the old one would take the new
@@ -181,6 +199,11 @@ var g_test_listener_shutdowns: usize = 0;
 /// Puts a stand-in in the bunker listener's slot, as a dialled listener would.
 pub fn offerBunkerListenerForTest(stand_in: usize) void {
     offerLiveRelay(bunker_watch_slot, @ptrFromInt(stand_in));
+}
+
+/// Offers a stand-in as a listener of `generation` does once it has dialled.
+pub fn offerBunkerListenerAsForTest(stand_in: usize, generation: u64) bool {
+    return offerBunkerListener(@ptrFromInt(stand_in), generation);
 }
 
 pub fn withdrawBunkerListenerForTest(stand_in: usize) void {

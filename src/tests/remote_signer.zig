@@ -453,6 +453,27 @@ test "an ended bunker pairing takes its listener's socket down" {
     try testing.expectEqual(@as(usize, 0), main.bunkerListenerForTest());
 }
 
+test "a listener still dialling for an ended pairing never takes the new one's slot" {
+    // It used to store its socket and then check the generation. Stored over
+    // the new listener's and then withdrawn, the slot was left empty: the live
+    // pairing had no keepalive, and a sign-out found nothing to take down.
+    defer main.resetBunkerConnectForTest();
+    const ended = main.remoteGenerationForTest();
+    main.bumpRemoteGenerationForTest();
+    const live = main.remoteGenerationForTest();
+    try testing.expect(main.offerBunkerListenerAsForTest(0x5000, live));
+
+    try testing.expect(!main.offerBunkerListenerAsForTest(0x6000, ended));
+    main.withdrawBunkerListenerForTest(0x6000);
+    try testing.expectEqual(@as(usize, 0x5000), main.bunkerListenerForTest());
+
+    // So the sign-out still reaches the live one.
+    const before = main.bunkerListenerShutdownsForTest();
+    main.resetBunkerConnectForTest();
+    try testing.expectEqual(@as(usize, 0), main.bunkerListenerForTest());
+    try testing.expectEqual(before + 1, main.bunkerListenerShutdownsForTest());
+}
+
 test "a key adopted while a bunker link waits takes the link down with it" {
     defer main.resetBunkerConnectForTest();
     defer main.clearIdentityForTest();
