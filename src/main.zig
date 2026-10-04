@@ -3816,6 +3816,13 @@ const quote_body_lines: usize = 4;
 const quote_skeleton_height: f32 = 34;
 /// The depth-1 pill's own height, stated because a `list_item` floors at 28.
 const quote_pill_height: f32 = 22;
+/// A quote card's picture is a thumbnail of what is one press away, not a copy
+/// of the feed's: this wide at most, and no taller than it is wide however tall
+/// the picture is (a taller one is `contain`ed in a box of its own shape).
+const quote_picture_width: f32 = 280;
+const quote_picture_max_aspect: f32 = 1.0;
+/// And no flatter than this, so a panorama is still a thing a press can land on.
+const quote_picture_min_aspect: f32 = 0.3;
 /// How wide the pill's one line may run before it elides, so a quoted note with
 /// a lot to say cannot push the pill across the row.
 const quote_pill_label_width: f32 = 190;
@@ -7190,6 +7197,9 @@ const quote_fetch_batch = 16;
 /// characters a line at the quote's register), so the clamp decides where the
 /// text ends rather than the cache. 64 entries, so the whole table is ~20 KiB.
 const quote_text_cap = 320;
+/// The longest picture address a quote keeps: a feed picture's, so the two
+/// surfaces agree about which addresses are pictures at all.
+const quote_image_url_cap = 192;
 /// Where a cached quote is in its life: asked for, in flight, in hand, or asked
 /// for enough times that no relay has it.
 pub const QuoteState = enum { idle, fetching, loaded, missing };
@@ -7233,10 +7243,9 @@ const QuoteEntry = struct {
     /// with an empty body and drew a card with a name, a time and nothing else,
     /// which reads as a rendering fault rather than as a picture.
     ///
-    /// The host and not the URL, because the card cannot show the picture: all
-    /// sixteen registry slots are spoken for (nine avatars, a banner, six feed
-    /// pictures) and taking one here would mean taking it from those. Pressing
-    /// the card opens the quoted note, where the picture draws with a real slot.
+    /// Still what the card says when it is not drawing the picture itself:
+    /// previews off, a URL too long to keep, or a file the note declares is not
+    /// an image.
     image_host_buf: [48]u8 = [_]u8{0} ** 48,
     image_host_len: u8 = 0,
     /// The quoted note's author asked for it to be covered (NIP-36), and why.
@@ -7246,6 +7255,22 @@ const QuoteEntry = struct {
     warned: bool = false,
     warning_buf: [warning_reason_bytes]u8 = [_]u8{0} ** warning_reason_bytes,
     warning_len: u8 = 0,
+    /// Where that picture is, when the card may fetch and draw it. Empty when
+    /// the note says the file is not an image or the address is longer than a
+    /// feed picture's (`NoteImage` leaves those in the body as links too).
+    ///
+    /// The picture is not held here. It lives in a media slot under
+    /// `quoteMediaKey`, the same table and the same pool of registry ids a feed
+    /// picture uses, so the card claims one only while it is on screen and the
+    /// pool takes it back the way it takes back a row's.
+    image_url_buf: [quote_image_url_cap]u8 = [_]u8{0} ** quote_image_url_cap,
+    image_url_len: u8 = 0,
+    /// Height over width and blurhash from the quoted note's own `imeta`, so the
+    /// card reserves the right box and shows the right colours before a byte has
+    /// arrived. Zero and empty when the note says nothing.
+    image_aspect: f32 = 0,
+    image_blur_buf: [40]u8 = [_]u8{0} ** 40,
+    image_blur_len: u8 = 0,
     /// What the quoted note itself quotes, if anything. Depth stops here (11g):
     /// one hop is a pill saying where it goes, never a third nested body. The
     /// reference is decoded from the event's own content at fill time, because
@@ -7259,6 +7284,13 @@ const QuoteEntry = struct {
     /// which is true about this reader's relays and false about the note.
     hints: RelayHints = .{},
     last_used: u64 = 0,
+
+    pub fn imageUrl(self: *const QuoteEntry) []const u8 {
+        return self.image_url_buf[0..self.image_url_len];
+    }
+    pub fn imageBlurhash(self: *const QuoteEntry) []const u8 {
+        return self.image_blur_buf[0..self.image_blur_len];
+    }
 };
 var g_quotes = [_]QuoteEntry{.{}} ** quote_cache_cap;
 var g_quote_clock: u64 = 0;
@@ -7870,6 +7902,22 @@ fn refreshQuotes(store: *nostr.store.Store) void {
         }
         var tmp: [note_content_cap]u8 = undefined;
         const omit = firstImageUrl(se.event.content) orelse "";
+        // What the card needs to draw the picture itself, from the same
+        // places a feed row reads them: the note's `imeta` for its shape and
+        // colours, `classifyMedia` for whether the file is a picture at all,
+        // and the same length ceiling a feed picture has.
+        const meta = imetaFor(se.event.tags, omit);
+        q.image_url_len = 0;
+        q.image_aspect = 0;
+        q.image_blur_len = 0;
+        if (omit.len > 0 and omit.len <= q.image_url_buf.len and classifyMedia(omit, meta.mime) == .image) {
+            @memcpy(q.image_url_buf[0..omit.len], omit);
+            q.image_url_len = @intCast(omit.len);
+            q.image_aspect = meta.aspect();
+            const b = @min(meta.blurhash.len, q.image_blur_buf.len);
+            @memcpy(q.image_blur_buf[0..b], meta.blurhash[0..b]);
+            q.image_blur_len = @intCast(b);
+        }
         const host = urlHost(omit);
         const host_len = @min(host.len, q.image_host_buf.len);
         @memcpy(q.image_host_buf[0..host_len], host[0..host_len]);
@@ -13789,6 +13837,16 @@ pub fn maxMediaImagesForTest() usize {
     return max_media_images;
 }
 
+pub const quote_picture_width_for_test = quote_picture_width;
+
+/// Whether the pool could take this id back right now: held, and neither on
+/// screen this pass nor mid-fetch.
+pub fn imageIdTakeableForTest(id: u64) bool {
+    if (id < 1 or id > image_registry_slots) return false;
+    const owners = imageIdOwners();
+    return imageIdSeen(owners[@intCast(id)]) != null;
+}
+
 pub fn resetMediaForTest() void {
     for (&g_media) |*m| m.down.release();
     g_media = [_]MediaSlot{.{}} ** max_media_images;
@@ -14183,9 +14241,18 @@ fn scanMediaFetches(fx: *Effects, model: *const Model) void {
         // can only evict what has scrolled away, never a picture needed later in
         // this same pass.
         const set = &g_level_visible[@min(g_visible_level, g_level_visible.len - 1)];
-        for (set.notes[0..set.note_count]) |id| markMediaWanted(id);
-        for (set.notes[0..set.note_count]) |id| {
-            if (model.noteById(id)) |note| fireMedia(fx, note, &fired, per_tick);
+        // Each id resolved once: `noteById` walks the whole feed before the
+        // level's own rows, and both loops below need the note.
+        var shown: [visible_set_cap]?*const Note = undefined;
+        for (set.notes[0..set.note_count], 0..) |id, i| {
+            markMediaWanted(id);
+            shown[i] = model.noteById(id);
+            if (shown[i]) |note| markQuoteMediaWanted(note, levelNoteFolds(model, note));
+        }
+        for (shown[0..set.note_count]) |maybe| {
+            const note = maybe orelse continue;
+            fireQuoteMedia(fx, note, levelNoteFolds(model, note), &fired, per_tick);
+            fireMedia(fx, note, &fired, per_tick);
         }
         return;
     }
@@ -14199,12 +14266,77 @@ fn scanMediaFetches(fx: *Effects, model: *const Model) void {
     var touch = window.first;
     while (touch <= window.last and touch < model.notes_len) : (touch += 1) {
         markMediaWanted(model.notes[touch].id);
+        markQuoteMediaWanted(&model.notes[touch], true);
     }
 
     var index = window.first;
     while (index <= window.last and index < model.notes_len) : (index += 1) {
+        fireQuoteMedia(fx, &model.notes[index], true, &fired, per_tick);
         fireMedia(fx, &model.notes[index], &fired, per_tick);
     }
+}
+
+/// The media-slot key for the picture a quote card shows: the quoted event's
+/// own feed key, picture zero.
+///
+/// The same key the quoted note's row would use if it were in the feed, on
+/// purpose. Where the reader has both on screen they share one slot and one
+/// registry id, and the picture is downloaded, decoded and held once.
+fn quoteMediaKey(quoted: [32]u8) i64 {
+    return mediaKey(feedKeyOf(quoted), 0);
+}
+
+/// Whether `note` draws its quote card at all right now. A collapsed long note
+/// shows the card only when the fold reaches past it, so a card behind the fold
+/// is not on screen and must not cost a fetch or a slot. The row's height
+/// estimate asks the same question, so the two agree.
+///
+/// `collapsible` is what the body builder is told: a thread's focal note is
+/// drawn whole whatever its length.
+fn quoteCardShown(note: *const Note, collapsible: bool) bool {
+    if (note.quote.kind != .event) return false;
+    const collapsed = collapsible and noteIsLong(note) and !isExpanded(note.id);
+    if (!collapsed) return true;
+    const quote_end = @as(usize, note.quote.off) + @as(usize, note.quote.len);
+    return quote_end <= collapsedLen(note.content(), note_collapse_chars);
+}
+
+/// A quote whose entry is in hand and carries a picture the card may load.
+/// Looks without touching the cache's recency: this runs for every row in the
+/// window, drawn or not, and must not make the cache think they all were.
+fn quotePictureFor(note: *const Note, collapsible: bool) ?*const QuoteEntry {
+    if (!quoteCardShown(note, collapsible)) return null;
+    for (&g_quotes) |*q| {
+        if (!q.used or !std.mem.eql(u8, &q.id, &note.quote.id)) continue;
+        // A covered quote (NIP-36) fetches nothing until it is shown.
+        if (q.state != .loaded or q.image_url_len == 0 or quoteCovered(q)) return null;
+        return q;
+    }
+    return null;
+}
+
+/// Marks the slot a quote card holds as wanted this pass, so the claim pass
+/// cannot evict a picture that is still on screen.
+fn markQuoteMediaWanted(note: *const Note, collapsible: bool) void {
+    const q = quotePictureFor(note, collapsible) orelse return;
+    if (mediaSlotFor(quoteMediaKey(q.id))) |m| m.last_used = g_image_clock;
+}
+
+/// Loads the picture of the quote card `note` draws, if it draws one.
+///
+/// Previews off means no fetch and no cache read, with no per-note "load" to
+/// ask for: the card names the picture and where it is from, and the press that
+/// was always there opens the note, where asking is offered.
+fn fireQuoteMedia(fx: *Effects, note: *const Note, collapsible: bool, fired: *usize, per_tick: usize) void {
+    if (!g_media_previews) return;
+    const q = quotePictureFor(note, collapsible) orelse return;
+    fireMediaSlot(fx, quoteMediaKey(q.id), q.imageUrl(), fired, per_tick);
+}
+
+/// Whether a note in the open level folds its body: all of them do except the
+/// thread's focal note, which `focalBody` draws whole.
+fn levelNoteFolds(model: *const Model, note: *const Note) bool {
+    return !(model.viewing_thread != 0 and note.id == model.thread_root.id);
 }
 
 /// Marks the picture slot for `note_id` wanted this pass (if it has one), so the
@@ -14241,7 +14373,18 @@ fn fireMediaAt(fx: *Effects, note: *const Note, index: usize, fired: *usize, per
     // this note's pictures. That is the point of the setting: not bandwidth, but
     // that reading a feed should not tell every host in it that you did.
     if (!g_media_previews and !isMediaAsked(note.id)) return;
-    const slot = claimMediaSlot(fx, mediaKey(note.id, index)) orelse return;
+    fireMediaSlot(fx, mediaKey(note.id, index), link, fired, per_tick);
+}
+
+/// Loads the picture at `link` into the media slot filed under `key`: claims
+/// the slot and a registry id, serves it from the disk cache, or fetches it.
+///
+/// The one body behind both a feed picture and a quote card's, so the two
+/// cannot disagree about slots, ids, the cache, the proxy or the retry rules.
+/// The callers decide WHETHER to load (previews, being on screen); this decides
+/// how.
+fn fireMediaSlot(fx: *Effects, key: i64, link: []const u8, fired: *usize, per_tick: usize) void {
+    const slot = claimMediaSlot(fx, key) orelse return;
     slot.last_used = g_image_clock;
     if (slot.state != .idle) return;
     // A slot is a place to put a picture; an id is the registry capacity to
@@ -19069,10 +19212,7 @@ fn noteRowEstimateWith(note: *const Note, chrome: f32, media: bool) f32 {
     // all, so a feed of quoting notes reported less than it drew.
     // The card sits at its own byte span in the body, so a collapsed note shows
     // it only when the fold reaches past it, exactly as `noteBodyAt` decides.
-    const quote_end = @as(usize, note.quote.off) + @as(usize, note.quote.len);
-    const quote_shown = note.quote.kind == .event and
-        (!collapsed or quote_end <= collapsedLen(note.content(), note_collapse_chars));
-    if (quote_shown) {
+    if (quoteCardShown(note, true)) {
         extent += quoteAsideExtent(note.quote.id);
     }
     return extent;
@@ -19094,14 +19234,14 @@ fn quoteAsideExtent(id: [32]u8) f32 {
         // The depth-1 pill, when the quoted note quotes something itself: it is
         // a row of its own under the body, and the row around it is priced.
         .loaded => blk: {
-            // A covered quote swaps its body for the cover chip and drops the
-            // picture chip; the pills under it are unchanged.
+            // A covered quote swaps its body for the cover chip and draws no
+            // picture; the pills under it are unchanged.
             const covered = quoteCovered(e);
             break :blk quote_aside_chrome +
                 (if (covered) cover_notice_height else quoteBodyLines(e) * body_line_height) +
                 (if (e.has_quote_of) quote_pill_height + 4 else 0) +
                 (if (kindRender(e.kind) == .unsupported) quote_pill_height + 4 else 0) +
-                (if (e.image_host_len > 0 and !covered) quote_pill_height + 4 else 0);
+                (if (e.image_host_len > 0 and !covered) (if (quoteShowsPicture(e)) quotePictureBox(quotePictureAspect(e)).height else quote_pill_height) + 4 else 0);
         },
     };
 }
@@ -27837,7 +27977,7 @@ fn quoteRule(ui: *AppUi, id: [32]u8) AppUi.Node {
         // answer the same question: a card with a name, a time and nothing
         // under it reads as a rendering fault, and this says which it is.
         if (kindRender(q.kind) == .unsupported) unsupportedKindChip(ui, q.kind) else ui.spacer(0),
-        if (q.image_host_len > 0 and !quoteCovered(q)) quoteMediaChip(ui, q.image_host_buf[0..q.image_host_len]) else ui.spacer(0),
+        if (q.image_host_len > 0 and !quoteCovered(q)) quoteMediaChip(ui, q) else ui.spacer(0),
         // A quote of a quote stops here. One more body would be a third voice in
         // a row, so the second hop is a pill that says where it goes.
         if (q.has_quote_of) quotingPill(ui, q.quote_of) else ui.spacer(0),
@@ -27855,12 +27995,6 @@ fn quoteBody(ui: *AppUi, note: *const Note) AppUi.Node {
     return node;
 }
 
-/// A picture the quote card cannot draw, named instead of left out.
-///
-/// Not a control: pressing the CARD already opens the quoted note, and that is
-/// where the picture renders with a registry slot of its own. A second press
-/// target here would offer a shorter way to the same place and take a slot to
-/// do it.
 /// Says that an event is of a kind this app has no way to draw, and which kind.
 ///
 /// The kind NUMBER, deliberately. A reader who sees "kind 31923" can look it up
@@ -27897,7 +28031,88 @@ fn unsupportedKindChip(ui: *AppUi, kind: u16) AppUi.Node {
     });
 }
 
-fn quoteMediaChip(ui: *AppUi, host: []const u8) AppUi.Node {
+/// Whether the card draws the picture itself rather than naming it. Previews
+/// off keeps the old, honest chip (nothing is fetched, so nothing could be
+/// drawn), and so does a quote with no address worth fetching.
+fn quoteShowsPicture(q: *const QuoteEntry) bool {
+    return g_media_previews and q.image_url_len > 0 and !quoteCovered(q);
+}
+
+/// The shape to reserve for a quote's picture: what its `imeta` declares, else
+/// what it measured the last time it was decoded (remembered past its slot, so
+/// an evicted picture does not shrink the card), else the feed's guess.
+fn quotePictureAspect(q: *const QuoteEntry) f32 {
+    if (q.image_aspect > 0) return q.image_aspect;
+    return recalledAspect(quoteMediaKey(q.id)) orelse picture_default_aspect;
+}
+
+pub const QuotePictureBox = struct { width: f32, height: f32 };
+
+/// The box a quote's picture is drawn in, for a given height over width.
+///
+/// Total on purpose: a note can declare any dimensions it likes and a decode can
+/// report none, so zero, negative, infinite and absurd shapes all land on a box
+/// the card can be priced for.
+pub fn quotePictureBox(aspect: f32) QuotePictureBox {
+    const shape = if (std.math.isFinite(aspect) and aspect > 0) aspect else picture_default_aspect;
+    const height = quote_picture_width * std.math.clamp(shape, quote_picture_min_aspect, quote_picture_max_aspect);
+    // Taller than the cap: the box is the picture's own shape at the capped
+    // height, so `contain` leaves no bare gutters inside the border.
+    const width = if (shape > quote_picture_max_aspect) height / shape else quote_picture_width;
+    return .{ .width = width, .height = height };
+}
+
+/// The picture a quote card holds, drawn from the media slot the scan pass gave
+/// it: its blurhash (or stripes) while it loads, the picture when it has arrived,
+/// a plain box when it will not come. All three are the same size. A picture
+/// whose note declares its shape lands without moving the card; one that does
+/// not is sized by the feed's guess until it has been decoded once, as a feed
+/// picture is.
+///
+/// With previews off, or no address worth fetching, the card names the picture
+/// and where it is from instead. Not a control either way: pressing the CARD
+/// already opens the quoted note, and a second press target here would only be a
+/// shorter way to the same place.
+fn quoteMediaChip(ui: *AppUi, q: *const QuoteEntry) AppUi.Node {
+    const host = q.image_host_buf[0..q.image_host_len];
+
+    if (quoteShowsPicture(q)) {
+        const p = theme.palette;
+        const box = quotePictureBox(quotePictureAspect(q));
+        const slot = mediaSlotFor(quoteMediaKey(q.id));
+        const inner: AppUi.Node = if (slot != null and slot.?.state == .loaded and slot.?.image_id != 0) blk: {
+            var picture = ui.image(.{
+                .image = slot.?.image_id,
+                .grow = 1,
+                .semantics = .{ .label = "Picture in the quoted note" },
+            });
+            picture.widget.image_fit = .contain;
+            break :blk picture;
+        } else if (slot != null and slot.?.state == .failed)
+            ui.column(.{ .grow = 1, .main = .center, .cross = .center, .gap = 6 }, .{
+                ui.appIcon(.{ .width = 14, .height = 14, .style = .{ .foreground = p.text_dim } }, "image"),
+                ui.paragraph(
+                    .{ .style = .{ .foreground = p.text_faint_alt } },
+                    &.{.{ .text = ui.fmt("Picture from {s} would not load", .{host}), .scale = meta_scale }},
+                ),
+            })
+        else
+            // Its own colours when the note carries a blurhash, stripes when it
+            // does not. Flat cells and not a registered image, so the wait costs
+            // no registry id: the id is claimed for the picture itself.
+            blurGrid(ui, q.imageBlurhash(), box.height);
+        return ui.row(.{ .gap = 0 }, .{
+            ui.el(.data_row, .{
+                .width = box.width,
+                .height = box.height,
+                .padding = 0,
+                .style = .{ .radius = picture_radius, .border = p.border_hairline, .stroke_width = 1, .background = p.surface_inset },
+            }, .{inner}),
+            ui.spacer(1),
+        });
+    }
+
+    // Otherwise show a pill saying the picture is there and where it's from.
     const p = theme.palette;
     return ui.row(.{ .gap = 0 }, .{
         ui.el(.panel, .{
@@ -28209,6 +28424,35 @@ pub fn quotingPillLabelForTest(ui: *AppUi, id: [32]u8) []const u8 {
 
 pub fn quoteBodyLinesForTest(e: *const QuoteEntry) f32 {
     return quoteBodyLines(e);
+}
+
+/// The media-slot key a quote's picture is filed under.
+pub fn quoteMediaKeyForTest(id: [32]u8) i64 {
+    return quoteMediaKey(id);
+}
+
+/// Where the slot filed under `key` is in its life, and the registry id it
+/// holds (0 for none), or null when no slot exists. Looks without claiming.
+pub fn mediaSlotStateForTest(key: i64) ?struct { state: []const u8, image_id: u64, url: []const u8 } {
+    const m = mediaSlotFor(key) orelse return null;
+    return .{ .state = @tagName(m.state), .image_id = m.image_id, .url = m.url() };
+}
+
+pub fn toggleExpandedForTest(note_id: i64) void {
+    toggleExpanded(note_id);
+}
+
+/// Leaves the slot under `key` the way a finished fetch would: a registry id
+/// taken from the pool, marked loaded at this size. The decode itself needs a
+/// platform codec a test does not have.
+pub fn markMediaLoadedForTest(fx: *Effects, key: i64, width: usize, height: usize) ?u64 {
+    const slot = claimMediaSlot(fx, key) orelse return null;
+    if (slot.image_id == 0) slot.image_id = acquireImageId(fx) orelse return null;
+    slot.state = .loaded;
+    slot.width = width;
+    slot.height = height;
+    rememberAspect(slot.note_id, width, height);
+    return slot.image_id;
 }
 
 pub fn noteRowEstimateForTest(note: *const Note, chrome: f32) f32 {

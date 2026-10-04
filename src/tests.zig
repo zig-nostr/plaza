@@ -12588,6 +12588,518 @@ test "a quote card with nothing to read is not a blank card" {
     }
 }
 
+// ---- a quote card draws the picture it quotes ---------------------------------
+
+const quote_picture_url = "http://127.0.0.1:9/shot.png";
+
+/// A model with one feed row quoting `quoted_id`, whose cache entry says the
+/// quoted note carries `quote_picture_url`.
+fn quotePictureModel(quoted_id: [32]u8, aspect: f32) !main.Model {
+    main.dropQuoteForTest(quoted_id);
+    main.seedQuoteForTest(quoted_id, [_]u8{0x2b} ** 32, 100, "");
+    const e = main.quoteForTest(quoted_id) orelse return error.NoQuote;
+    const host = "127.0.0.1:9";
+    @memcpy(e.image_host_buf[0..host.len], host);
+    e.image_host_len = host.len;
+    @memcpy(e.image_url_buf[0..quote_picture_url.len], quote_picture_url);
+    e.image_url_len = quote_picture_url.len;
+    e.image_aspect = aspect;
+    const hash = "LEHV6nWB2yk8pyo0adR*.7kCMdnj";
+    @memcpy(e.image_blur_buf[0..hash.len], hash);
+    e.image_blur_len = hash.len;
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.notes[0] = threadNote(0xA1, 100, 0);
+    model.notes[0].id = 7;
+    const body = "Look at this.";
+    @memcpy(model.notes[0].content_buf[0..body.len], body);
+    model.notes[0].content_len = @intCast(body.len);
+    model.notes[0].quote = .{ .kind = .event, .id = quoted_id, .off = 0, .len = 0 };
+    model.notes_len = 1;
+    return model;
+}
+
+test "a quote card loads and draws the picture in the note it quotes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    const previews_were = main.mediaPreviews();
+    const proxy_was = main.mediaProxyOn();
+    main.setMediaPreviews(true);
+    // The proxy off, so the address that goes out is the one in the note: this
+    // test reaches a closed loopback port and nothing else.
+    main.setMediaProxyOn(false);
+    defer main.setMediaPreviews(previews_were);
+    defer main.setMediaProxyOn(proxy_was);
+
+    const quoted_id = [_]u8{0x5e} ** 32;
+    defer main.dropQuoteForTest(quoted_id);
+    var model = try quotePictureModel(quoted_id, 0.5);
+    const key = main.quoteMediaKeyForTest(quoted_id);
+
+    // Nothing is held until a pass runs.
+    try testing.expect(main.mediaSlotStateForTest(key) == null);
+
+    var fx = main.EffectsForTest.init(testing.allocator);
+    defer fx.deinit();
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+
+    // The card went through the feed's own pipeline: a media slot, a registry
+    // id from the shared pool, and a fetch for the note's address.
+    const held = main.mediaSlotStateForTest(key) orelse return error.NoSlotClaimed;
+    try testing.expectEqualStrings("fetching", held.state);
+    try testing.expect(held.image_id != 0);
+    try testing.expectEqualStrings(quote_picture_url, held.url);
+    try testing.expectEqualStrings("media", main.imageIdOwnerNameForTest(held.image_id));
+    try testing.expectEqual(@as(?bool, true), main.mediaSlotWantedForTest(key));
+
+    // While it loads the card shows the picture's own colours in the box it
+    // will fill, not the chip that names it.
+    const box = main.quotePictureBox(0.5);
+    const priced_loading = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+    {
+        const p = try painted.Painted.render(arena, &model);
+        try testing.expect(findAnyText(p.tree.root, "Picture from 127.0.0.1:9") == null);
+        try testing.expect(p.frameOf("Picture in the quoted note") == null);
+        const rows = p.framesOf("Open thread");
+        if (rows.len < 1) return error.NoRow;
+        try testing.expect(@abs(rows[0].height - priced_loading) <= 1.5 * main.body_line_height);
+    }
+
+    // Arrived: the picture, in the same box, so the row does not move.
+    try testing.expect(main.markMediaLoadedForTest(&fx, key, 800, 400) != null);
+    {
+        const p = try painted.Painted.render(arena, &model);
+        const frame = p.frameOf("Picture in the quoted note") orelse return error.PictureNotDrawn;
+        try testing.expectApproxEqAbs(box.width, frame.width, 1.0);
+        try testing.expectApproxEqAbs(box.height, frame.height, 1.0);
+        const rows = p.framesOf("Open thread");
+        if (rows.len < 1) return error.NoRow;
+        const priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+        try testing.expectApproxEqAbs(priced_loading, priced, 0.001);
+        if (@abs(rows[0].height - priced) > 1.5 * main.body_line_height) {
+            std.debug.print("\nrow with a quoted picture draws {d}, priced {d}\n", .{ rows[0].height, priced });
+            return error.PictureNotPriced;
+        }
+    }
+}
+
+test "a quote card's picture follows the previews setting and what is on screen" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    const previews_were = main.mediaPreviews();
+    const proxy_was = main.mediaProxyOn();
+    defer main.setMediaPreviews(previews_were);
+    defer main.setMediaProxyOn(proxy_was);
+    main.setMediaProxyOn(false);
+
+    const quoted_id = [_]u8{0x5f} ** 32;
+    defer main.dropQuoteForTest(quoted_id);
+    var model = try quotePictureModel(quoted_id, 0.5);
+    const key = main.quoteMediaKeyForTest(quoted_id);
+    var fx = main.EffectsForTest.init(testing.allocator);
+    defer fx.deinit();
+
+    // Previews off: nothing leaves the machine and no id is spent. The card
+    // names the picture and where it is from, as it did before, and the row is
+    // priced for that chip rather than for a box that is not drawn.
+    main.setMediaPreviews(false);
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    try testing.expect(main.mediaSlotStateForTest(key) == null);
+    {
+        const p = try painted.Painted.render(arena, &model);
+        try testing.expect(findAnyText(p.tree.root, "Picture from 127.0.0.1:9") != null);
+        try testing.expect(p.frameOf("Picture in the quoted note") == null);
+        const rows = p.framesOf("Open thread");
+        if (rows.len < 1) return error.NoRow;
+        const priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+        try testing.expect(@abs(rows[0].height - priced) <= 0.5 * main.body_line_height);
+    }
+
+    // Previews on, but the row is nowhere near the window: no fetch for a card
+    // nobody is looking at.
+    main.setMediaPreviews(true);
+    var far = main.initialModel();
+    far.stage = .ready;
+    const far_row = main.maxMediaImagesForTest() + 3;
+    for (0..far_row + 1) |i| {
+        far.notes[i] = threadNote(@intCast(0x10 + i), 100, 0);
+        far.notes[i].id = @intCast(100 + i);
+    }
+    far.notes[far_row].quote = .{ .kind = .event, .id = quoted_id, .off = 0, .len = 0 };
+    far.notes_len = far_row + 1;
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &far);
+    try testing.expect(main.mediaSlotStateForTest(key) == null);
+
+    // A quote still resolving has no address to load yet. (Every model shares
+    // the one feed buffer, so the row is made again after the far one.)
+    model = try quotePictureModel(quoted_id, 0.5);
+    main.beginImagePassForTest();
+    main.quoteForTest(quoted_id).?.state = .fetching;
+    main.scanMediaFetchesForTest(&fx, &model);
+    try testing.expect(main.mediaSlotStateForTest(key) == null);
+    main.quoteForTest(quoted_id).?.state = .loaded;
+
+    // On screen and loaded: the slot is claimed.
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    const held = main.mediaSlotStateForTest(key) orelse return error.NoSlotClaimed;
+    try testing.expect(held.image_id != 0);
+}
+
+test "a covered quote card neither draws nor fetches its picture until it is shown" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    const previews_were = main.mediaPreviews();
+    const proxy_was = main.mediaProxyOn();
+    defer main.setMediaPreviews(previews_were);
+    defer main.setMediaProxyOn(proxy_was);
+    main.setMediaProxyOn(false);
+    main.setMediaPreviews(true);
+    main.forgetUncoveredForTest();
+    defer main.forgetUncoveredForTest();
+    main.setShowSensitive(false);
+    defer main.setShowSensitive(false);
+
+    const quoted_id = [_]u8{0x5f} ** 32;
+    defer main.dropQuoteForTest(quoted_id);
+    var model = try quotePictureModel(quoted_id, 0.5);
+    main.warnQuoteForTest(quoted_id, "spoilers");
+    const key = main.quoteMediaKeyForTest(quoted_id);
+    var fx = main.EffectsForTest.init(testing.allocator);
+    defer fx.deinit();
+
+    // Covered: no slot, no picture box, and the row is priced for the chip.
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    try testing.expect(main.mediaSlotStateForTest(key) == null);
+    {
+        const p = try painted.Painted.render(arena, &model);
+        try testing.expect(p.frameOf("Picture in the quoted note") == null);
+        try testing.expect(findAnyText(p.tree.root, "Picture from 127.0.0.1:9") == null);
+        const rows = p.framesOf("Open thread");
+        if (rows.len < 1) return error.NoRow;
+        const priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome);
+        try testing.expect(@abs(rows[0].height - priced) <= 0.5 * main.body_line_height);
+    }
+
+    // Shown: the same card claims its picture.
+    main.setShowSensitive(true);
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    const held = main.mediaSlotStateForTest(key) orelse return error.NoSlotClaimed;
+    try testing.expect(held.image_id != 0);
+}
+
+test "a quote card behind a note's fold costs nothing until it is unfolded" {
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    const previews_were = main.mediaPreviews();
+    const proxy_was = main.mediaProxyOn();
+    main.setMediaPreviews(true);
+    main.setMediaProxyOn(false);
+    defer main.setMediaPreviews(previews_were);
+    defer main.setMediaProxyOn(proxy_was);
+
+    const quoted_id = [_]u8{0x63} ** 32;
+    defer main.dropQuoteForTest(quoted_id);
+    var model = try quotePictureModel(quoted_id, 0.5);
+    // A long body with the card at its far end: a collapsed note draws only the
+    // fold, so the card is not on screen.
+    const note = &model.notes[0];
+    @memset(note.content_buf[0..600], 'a');
+    note.content_len = 600;
+    note.quote = .{ .kind = .event, .id = quoted_id, .off = 580, .len = 0 };
+    note.id = 8_001;
+    const key = main.quoteMediaKeyForTest(quoted_id);
+
+    var fx = main.EffectsForTest.init(testing.allocator);
+    defer fx.deinit();
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    try testing.expect(main.mediaSlotStateForTest(key) == null);
+
+    // Unfolded, the card is drawn and the picture is wanted.
+    main.toggleExpandedForTest(note.id);
+    defer main.toggleExpandedForTest(note.id);
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    try testing.expect(main.mediaSlotStateForTest(key) != null);
+}
+
+test "an earlier row cannot take the picture a quote card further down is showing" {
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    const previews_were = main.mediaPreviews();
+    const proxy_was = main.mediaProxyOn();
+    main.setMediaPreviews(true);
+    main.setMediaProxyOn(false);
+    defer main.setMediaPreviews(previews_were);
+    defer main.setMediaProxyOn(proxy_was);
+
+    const quoted_id = [_]u8{0x64} ** 32;
+    defer main.dropQuoteForTest(quoted_id);
+    var model = try quotePictureModel(quoted_id, 0.5);
+    const key = main.quoteMediaKeyForTest(quoted_id);
+    var fx = main.EffectsForTest.init(testing.allocator);
+    defer fx.deinit();
+
+    // Every media slot is held: the quote's, loaded, and eleven others the
+    // reader has scrolled past. The quote's is the oldest of the lot.
+    const held_id = main.markMediaLoadedForTest(&fx, key, 800, 400) orelse return error.NoId;
+    for (0..main.maxMediaImagesForTest() - 1) |i| _ = main.claimMediaSlotForTest(&fx, @intCast(1000 + i));
+    main.beginImagePassForTest();
+    main.beginImagePassForTest();
+
+    // Now a row ABOVE the quote card wants a picture of its own. It is served
+    // first, and the pool must take a slot from the ones scrolled past, not the
+    // one the card below it is drawing in this very pass.
+    model.notes[1] = model.notes[0];
+    model.notes[0] = threadNote(0xA2, 100, 0);
+    model.notes[0].id = 50;
+    _ = model.notes[0].setImageForTest(0, "http://127.0.0.1:9/above.png");
+    model.notes[1].id = 51;
+    model.notes_len = 2;
+    main.scanMediaFetchesForTest(&fx, &model);
+
+    const kept = main.mediaSlotStateForTest(key) orelse return error.PictureTakenFromTheCard;
+    try testing.expectEqualStrings("loaded", kept.state);
+    try testing.expectEqual(held_id, kept.image_id);
+    try testing.expect(main.mediaSlotStateForTest(50) != null);
+}
+
+test "a quote card gives its picture back when it scrolls away" {
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    const previews_were = main.mediaPreviews();
+    const proxy_was = main.mediaProxyOn();
+    main.setMediaPreviews(true);
+    main.setMediaProxyOn(false);
+    defer main.setMediaPreviews(previews_were);
+    defer main.setMediaProxyOn(proxy_was);
+
+    const quoted_id = [_]u8{0x60} ** 32;
+    defer main.dropQuoteForTest(quoted_id);
+    var model = try quotePictureModel(quoted_id, 0.5);
+    const key = main.quoteMediaKeyForTest(quoted_id);
+    var fx = main.EffectsForTest.init(testing.allocator);
+    defer fx.deinit();
+
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    const id = (main.markMediaLoadedForTest(&fx, key, 800, 400)).?;
+
+    // On screen this pass: the pool may not take it.
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    try testing.expect(!main.imageIdTakeableForTest(id));
+
+    // The next pass the row is gone: the pool may take it, exactly as it takes
+    // a feed row's, and the id is not reserved for quote cards.
+    main.beginImagePassForTest();
+    model.notes_len = 0;
+    main.scanMediaFetchesForTest(&fx, &model);
+    try testing.expect(main.imageIdTakeableForTest(id));
+    try testing.expectEqual(@as(?bool, false), main.mediaSlotWantedForTest(key));
+}
+
+test "a thread draws the picture of a quote in a reply on screen, and only those" {
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    main.setIdentityForTest([_]u8{0x77} ** 32);
+    defer main.clearIdentityForTest();
+    const previews_were = main.mediaPreviews();
+    const proxy_was = main.mediaProxyOn();
+    main.setMediaPreviews(true);
+    main.setMediaProxyOn(false);
+    defer main.setMediaPreviews(previews_were);
+    defer main.setMediaProxyOn(proxy_was);
+
+    const on_screen = [_]u8{0x61} ** 32;
+    const below = [_]u8{0x62} ** 32;
+    defer main.dropQuoteForTest(on_screen);
+    defer main.dropQuoteForTest(below);
+    _ = try quotePictureModel(on_screen, 0.5);
+    _ = try quotePictureModel(below, 0.5);
+
+    var model = main.initialModel();
+    model.stage = .ready;
+    model.viewing_thread = 1;
+    model.thread_root.id = 1;
+    model.thread_root.pubkey = [_]u8{0x55} ** 32;
+    for (0..2) |i| {
+        model.thread_notes[i] = main.Note{ .created_at = 1_800_000_000 - @as(i64, @intCast(i)) };
+        model.thread_notes[i].id = @intCast(900 + i);
+        model.thread_notes[i].pubkey = [_]u8{0x55} ** 32;
+        model.thread_notes[i].event_id = [_]u8{@intCast(i + 1)} ** 32;
+        model.thread_notes[i].quote = .{ .kind = .event, .id = if (i == 0) on_screen else below, .off = 0, .len = 0 };
+    }
+    model.thread_notes_len = 2;
+
+    var fx = main.EffectsForTest.init(testing.allocator);
+    defer fx.deinit();
+    main.recordVisibleNotesForTest(&[_]i64{900});
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+    try testing.expect(main.mediaSlotStateForTest(main.quoteMediaKeyForTest(on_screen)) != null);
+    try testing.expect(main.mediaSlotStateForTest(main.quoteMediaKeyForTest(below)) == null);
+}
+
+/// The drawn height of the first feed row and what the estimate charges for it.
+fn quoteRowHeights(arena: std.mem.Allocator, model: *main.Model) !struct { drawn: f32, priced: f32 } {
+    const p = try painted.Painted.render(arena, model);
+    const rows = p.framesOf("Open thread");
+    if (rows.len < 1) return error.NoRow;
+    return .{ .drawn = rows[0].height, .priced = main.noteRowEstimateForTest(&model.notes[0], main.feed_row_chrome) };
+}
+
+test "a quote's picture is priced at exactly the box it draws, before and after its shape is known" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    main.resetMediaForTest();
+    defer main.resetMediaForTest();
+    const previews_were = main.mediaPreviews();
+    const proxy_was = main.mediaProxyOn();
+    main.setMediaProxyOn(false);
+    defer main.setMediaPreviews(previews_were);
+    defer main.setMediaProxyOn(proxy_was);
+
+    // No `dim`: the shape is a guess until the picture has been decoded once.
+    const quoted_id = [_]u8{0x65} ** 32;
+    defer main.dropQuoteForTest(quoted_id);
+    var model = try quotePictureModel(quoted_id, 0);
+    const key = main.quoteMediaKeyForTest(quoted_id);
+
+    // The same row with the chip instead of the box is the baseline: whatever
+    // slack the rest of the row's estimate has cancels out, and what is left is
+    // the box against its price, which has to match to the pixel.
+    main.setMediaPreviews(false);
+    const chip = try quoteRowHeights(arena, &model);
+
+    main.setMediaPreviews(true);
+    var fx = main.EffectsForTest.init(testing.allocator);
+    defer fx.deinit();
+    main.beginImagePassForTest();
+    main.scanMediaFetchesForTest(&fx, &model);
+
+    const guessed = try quoteRowHeights(arena, &model);
+    try testing.expectApproxEqAbs(guessed.priced - chip.priced, guessed.drawn - chip.drawn, 1.0);
+
+    // Decoded at 2:1. The box takes the measured shape, and the estimate moves
+    // with it rather than staying at the guess.
+    try testing.expect(main.markMediaLoadedForTest(&fx, key, 800, 400) != null);
+    const measured = try quoteRowHeights(arena, &model);
+    try testing.expectApproxEqAbs(measured.priced - chip.priced, measured.drawn - chip.drawn, 1.0);
+    const moved = main.quotePictureBox(0).height - main.quotePictureBox(0.5).height;
+    try testing.expectApproxEqAbs(moved, guessed.priced - measured.priced, 0.01);
+
+    // Evicted, the slot is gone but the shape is remembered, so the card does
+    // not fall back to the guess and shift the feed on the way back up.
+    main.resetMediaForTest();
+    const recalled = try quoteRowHeights(arena, &model);
+    try testing.expectApproxEqAbs(measured.priced, recalled.priced, 0.01);
+    try testing.expectApproxEqAbs(measured.drawn, recalled.drawn, 1.0);
+}
+
+test "a quote's picture box is total over whatever shape a note declares" {
+    const cases = [_]f32{ 0, -1, 0.0001, 0.3, 0.5, 0.66, 1.0, 1.5, 4, 65535, std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32) };
+    for (cases) |aspect| {
+        const box = main.quotePictureBox(aspect);
+        try testing.expect(std.math.isFinite(box.width) and std.math.isFinite(box.height));
+        // Never empty, never wider than the thumbnail, never taller than it is
+        // wide: the card has to be priced for whatever comes through here.
+        try testing.expect(box.width > 0 and box.height > 0);
+        try testing.expect(box.width <= main.quote_picture_width_for_test);
+        try testing.expect(box.height <= main.quote_picture_width_for_test);
+    }
+    // No declared shape lands on the feed's guess, not on a square or a sliver.
+    const unknown = main.quotePictureBox(0);
+    try testing.expectApproxEqAbs(main.quote_picture_width_for_test * 0.66, unknown.height, 0.5);
+    // A tall picture gets a box of its own shape rather than bare gutters.
+    const tall = main.quotePictureBox(2);
+    try testing.expectApproxEqAbs(main.quote_picture_width_for_test / 2, tall.width, 0.5);
+    try testing.expectApproxEqAbs(main.quote_picture_width_for_test, tall.height, 0.5);
+}
+
+test "the fill path keeps what the card needs to draw the picture, and refuses what it should" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = try signer.keyPairFromSecretKey([_]u8{62} ** 32);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/quotedpic.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+
+    const url = "https://i.nostr.build/aBcD1234.jpg";
+    const hash = "LEHV6nWB2yk8pyo0adR*.7kCMdnj";
+    const described = try signedKind(arena, signer, kp, 1_800_000_000, 1, &[_]nostr.event.Tag{
+        &.{ "imeta", "url " ++ url, "dim 800x400", "blurhash " ++ hash },
+    }, "look " ++ url);
+    // A file the note itself says is a video, however it is named.
+    const video_url = "https://i.nostr.build/clip.jpg";
+    const video = try signedKind(arena, signer, kp, 1_800_000_001, 1, &[_]nostr.event.Tag{
+        &.{ "imeta", "url " ++ video_url, "m video/mp4" },
+    }, video_url);
+    // An address longer than a feed picture keeps.
+    const long_url = "https://i.nostr.build/" ++ "a" ** 200 ++ ".jpg";
+    const long = try signedNote(arena, signer, kp, 1_800_000_002, long_url);
+    // No imeta at all: a picture of unknown shape.
+    const bare_url = "https://i.nostr.build/bare.png";
+    const bare = try signedNote(arena, signer, kp, 1_800_000_003, bare_url);
+    for ([_]nostr.event.Event{ described, video, long, bare }) |ev| {
+        _ = try store.ingest(arena, ev, .{});
+        main.dropQuoteForTest(ev.id);
+        main.wantQuoteForTest(ev.id);
+    }
+    main.refreshQuotesForTest(&store);
+
+    const d = main.quoteForTest(described.id) orelse return error.NoQuote;
+    try testing.expectEqualStrings(url, d.imageUrl());
+    try testing.expectApproxEqAbs(@as(f32, 0.5), d.image_aspect, 0.0001);
+    try testing.expectEqualStrings(hash, d.imageBlurhash());
+    // The slot key is the one the quoted note's own feed row would use, so the
+    // two share a slot when both are on screen.
+    try testing.expectEqual(main.mediaKeyForTest(main.noteIdOf(described), 0), main.quoteMediaKeyForTest(described.id));
+
+    const v = main.quoteForTest(video.id) orelse return error.NoQuote;
+    try testing.expectEqual(@as(usize, 0), v.imageUrl().len);
+    // Still named, as before: the card knows there is a file and where from.
+    try testing.expect(v.image_host_len > 0);
+
+    const l = main.quoteForTest(long.id) orelse return error.NoQuote;
+    try testing.expectEqual(@as(usize, 0), l.imageUrl().len);
+    try testing.expect(l.image_host_len > 0);
+
+    const b = main.quoteForTest(bare.id) orelse return error.NoQuote;
+    try testing.expectEqualStrings(bare_url, b.imageUrl());
+    try testing.expectEqual(@as(f32, 0), b.image_aspect);
+    try testing.expectEqual(@as(usize, 0), b.imageBlurhash().len);
+}
+
 // ---- P13: a door to the thing holding the key --------------------------------
 
 test "Settings offers a look at Notary, and only when there is one to look at" {
