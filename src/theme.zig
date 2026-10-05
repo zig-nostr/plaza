@@ -7,8 +7,8 @@
 //!   - The CHROME has no colored primary: its one working accent is a porcelain
 //!     white (`accent`) on near-black (`on_accent`), and the interface lives on
 //!     typography and spacing. Color enters in exactly one place, identity and
-//!     content: `accent_identity`, a violet, carries @handles, @mentions and
-//!     in-text URLs. Status colors (success, like, zap amber) are the only other
+//!     content: `accent_identity`, a violet, carries @handles, @mentions,
+//!     #hashtags and in-text URLs. Status colors (success, like, zap amber) are the only other
 //!     hues, and each one means a state rather than a brand.
 //!   - The type is Geist (prose) and Geist Mono (metadata, labels, code), in
 //!     REAL weights. The SDK's default sans IS Geist, and span weights route
@@ -31,8 +31,9 @@
 //!
 //! Violet used to be brand-signal only (the app icon, the mark). The redesign
 //! gives it one working job: `accent_identity` marks IDENTITY and CONTENT, which
-//! is to say @handles, @mentions and in-text links. Chrome stays porcelain, so a
-//! violet run in the interface always means "a person, or something they wrote".
+//! is to say @handles, @mentions, #hashtags and in-text links. Chrome stays
+//! porcelain, so a violet run in the interface always means "a person, or
+//! something they wrote".
 //!
 //! ONE EXCEPTION, and it is a narrow one: inside a PLACE, both accents become
 //! the community's own colour (see `PlaceColor` and `place_color_fn`). The rule
@@ -240,8 +241,9 @@ pub const palette = struct {
     pub const on_accent = hex("#141416");
 
     // The IDENTITY accent: violet, and the only colored accent in the app. It
-    // is reserved for identity and content, never for chrome: @handles,
-    // @mentions inside a note body, and in-text URLs. Chrome stays porcelain.
+    // is reserved for identity and content, never for chrome: @handles, and
+    // @mentions, #hashtags and in-text URLs inside a note body. Chrome stays
+    // porcelain.
     // Reaching it from a TextSpan goes through the `info` color token (see
     // `tokens` below), because a span names a token field, not a Color.
     // A light-mode counterpart (#6c53c9) is recorded in the round-5 plan for a
@@ -441,6 +443,12 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
             t.colors.accent = p.accent;
             t.colors.accent_text = p.on_accent;
             t.colors.focus_ring = p.border_focus;
+            // The toolkit floors every `list_item` at this height. Every
+            // pressable Plaza builds is one (see `pressRow` in main.zig), and the
+            // pills, links and verbs among them are shorter than that, so the
+            // floor made each of them taller than its content. Rows that were
+            // sized by the floor state `list_row_height`.
+            t.metrics.row_extent = 0;
             t.colors.disabled = p.surface_inset;
 
             // The default scrim is a 10% wash that leans on a backdrop blur for
@@ -568,8 +576,8 @@ pub fn tokens(comptime Model: type) fn (*const Model) canvas.DesignTokens {
                 t.colors.accent_text = c.on_primary;
                 // The IDENTITY channel, and this is the one that actually makes
                 // a room feel like somebody's. The accent reaches a couple of
-                // buttons; `info` is what every @handle, @mention and in-text
-                // URL in the feed is inked with, so it is the difference
+                // buttons; `info` is what every @handle, @mention, #hashtag and
+                // in-text URL in the feed is inked with, so it is the difference
                 // between one coloured control and a room that reads as the
                 // community's. The violet is Plaza's, and inside a place it has
                 // no business overruling the people who live there.
