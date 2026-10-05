@@ -102,6 +102,13 @@ var g_seal_base_half: ?[32]u8 = null;
 
 var g_half_clock: u64 = 0;
 
+/// Lists read with a half that found no slot, because every slot was pinned.
+/// Nothing else would read them again: on a bunker with asks out, the asks run
+/// out, their slots come free, and the list's half was never claimed, so its
+/// private entries stayed hidden until a press, a new list or a restart. The
+/// tick reads each one again once a slot can be had (`rereadWantedLists`).
+var g_reread_wanted: [std.meta.fields(HalfList).len]bool = [_]bool{false} ** std.meta.fields(HalfList).len;
+
 /// Guards everything above, and `g_private_ciphertext`. A relay's reader
 /// thread reads halves through an arriving list (`ingestMuteList`, and
 /// `ingestBookmarkList` by way of the store), while the UI thread asks, answers
@@ -466,6 +473,9 @@ pub fn privateHalfOpened(gpa: std.mem.Allocator, list: HalfList, content: []cons
         lockHalves();
         defer unlockHalves();
         g_current_half[@intFromEnum(list)] = if (content.len == 0) null else privateHalfId(content);
+        // This read is the list's latest, so only its own outcome says whether
+        // the list still wants reading again.
+        g_reread_wanted[@intFromEnum(list)] = false;
         if (content.len == 0) return null;
         const id = privateHalfId(content);
         if (slotOfUnlocked(id)) |i| {
@@ -475,7 +485,10 @@ pub fn privateHalfOpened(gpa: std.mem.Allocator, list: HalfList, content: []cons
             return gpa.dupe(u8, h.plain()) catch null;
         }
         // Never seen. Claim a slot so the tick asks Notary for it.
-        const i = slotToGiveUpUnlocked() orelse return null;
+        const i = slotToGiveUpUnlocked() orelse {
+            g_reread_wanted[@intFromEnum(list)] = true;
+            return null;
+        };
         if (!claimPrivateHalfUnlocked(i, id, content)) return null;
         break :claim i;
     };
@@ -568,12 +581,30 @@ pub fn endHalfAsk(index: u8, id: [32]u8, end: HalfAskEnd) bool {
     }
     return true;
 }
+
+/// Reads again each list whose half found no slot, once one can be had. On the
+/// UI thread, from the tick, and outside the lock: a read takes it, and the
+/// list's own reload takes the list's lock.
+fn rereadWantedLists() void {
+    var wanted: [g_reread_wanted.len]bool = undefined;
+    {
+        lockHalves();
+        defer unlockHalves();
+        if (slotToGiveUpUnlocked() == null) return;
+        wanted = g_reread_wanted;
+        g_reread_wanted = [_]bool{false} ** g_reread_wanted.len;
+    }
+    if (wanted[@intFromEnum(HalfList.mutes)]) loadMutesFromStore();
+    if (wanted[@intFromEnum(HalfList.bookmarks)]) loadBookmarksFromStore();
+}
+
 /// Asks Notary to open one private half, if any is waiting and the keyholder
 /// can answer. One at a time: these are rare, and a batch would need the
 /// ciphertexts held somewhere while the answer travels.
 pub fn scanPrivateHalves(fx: *Effects) void {
     if (!signerIsHealthy()) return;
     const me = activePubkey() orelse return;
+    rereadWantedLists();
     const gpa = std.heap.page_allocator;
     const remote = keyholder.g_signer_kind == .remote;
     // The ask is settled under the lock and sent after it: sending takes
@@ -718,6 +749,7 @@ pub fn forgetPrivateHalves() void {
         defer unlockHalves();
         for (0..g_private_halves.len) |i| releaseSlotUnlocked(i);
         g_current_half = [_]?[32]u8{null} ** g_current_half.len;
+        g_reread_wanted = [_]bool{false} ** g_reread_wanted.len;
         g_seal_base_half = null;
     }
     // A bunker's answer the listener parked and the tick has not applied yet
@@ -922,6 +954,11 @@ pub fn readPrivateHalfForTest(list: HalfList, content: []const u8) bool {
     const plain = privateHalfOpened(gpa, list, content) orelse return false;
     freePrivatePlain(gpa, plain);
     return true;
+}
+
+/// One tick's worth of `scanPrivateHalves`.
+pub fn scanPrivateHalvesForTest(fx: *Effects) void {
+    scanPrivateHalves(fx);
 }
 
 /// How many decrypts have been asked over Notary's door.

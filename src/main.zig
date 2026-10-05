@@ -6409,6 +6409,7 @@ pub const HalfList = private_lists.HalfList;
 pub const privateHalfStateOfForTest = private_lists.privateHalfStateOfForTest;
 pub const readPrivateHalfForTest = private_lists.readPrivateHalfForTest;
 pub const halfAskSeqForTest = private_lists.halfAskSeqForTest;
+pub const scanPrivateHalvesForTest = private_lists.scanPrivateHalvesForTest;
 pub const handlePrivateHalf = private_lists.handlePrivateHalf;
 pub const parkHalfAnswer = private_lists.parkHalfAnswer;
 pub const privateHalfGate = private_lists.privateHalfGate;

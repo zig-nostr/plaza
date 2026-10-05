@@ -556,3 +556,66 @@ test "a list read on a relay's thread never sees another half's plaintext" {
     thread.join();
     try testing.expectEqual(@as(u32, 0), bad.load(.monotonic));
 }
+
+test "a list whose half found no slot is read again once one comes free" {
+    // On a bunker with asks out, every slot can be pinned when a new mute list
+    // arrives. Its half found no slot, and nothing read the list again after
+    // the asks ran out, so the private mutes stayed hidden until a press, a
+    // newer list or a restart.
+    main.forgetPrivateHalvesForTest();
+    main.forgetMutesForTest();
+    main.clearPendingForTest();
+    defer {
+        main.setRemoteStateForTest(0, 0);
+        main.clearPendingForTest();
+        main.forgetPrivateHalvesForTest();
+        main.forgetMutesForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/halfreread.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    const secret = [_]u8{0x86} ** 32;
+    const kp = try signer.keyPairFromSecretKey(secret);
+    main.setIdentityForTest(secret);
+    // A connected bunker that has not refused a signature, so the tick asks.
+    main.setRemoteStateForTest(2, 0);
+    main.setRemotePubkeyForTest(kp.public_key);
+    main.setStoreForTest(&store);
+
+    // Every slot waits on the bunker.
+    var asks: [4]u8 = undefined;
+    var name_buf: [16]u8 = undefined;
+    for (&asks, 0..) |*slot, n| {
+        const name = try std.fmt.bufPrint(&name_buf, "asked-{d}", .{n});
+        slot.* = main.claimPrivateHalfPendingForTest(name) orelse return error.NoSlot;
+    }
+
+    // The reader's mute list arrives, with a private half that finds no slot.
+    const mute_half = "AjustSomeNip44ShapedBase64ForTheBunkerToOpen";
+    const ev = try nostr.event.create(arena, signer, kp, 1_800_000_000, 10000, &.{}, mute_half, null);
+    _ = try main.plazaIngestVerifiedForTest(arena, ev, signer);
+    try testing.expectEqualStrings("none", main.privateHalfStateOfForTest(mute_half));
+
+    // A tick with every slot still pinned changes nothing.
+    var fx: main.EffectsForTest = undefined;
+    var model = main.initialModel();
+    main.scanPrivateHalvesForTest(&fx);
+    try testing.expectEqualStrings("none", main.privateHalfStateOfForTest(mute_half));
+
+    // One ask runs out, and the next tick claims the list's half and asks it.
+    if (!main.timeoutRemoteHalfForTest(asks[0])) return error.NoPendingSlot;
+    main.scanPendingRemoteForTest(&model, &fx);
+    try testing.expectEqualStrings("refused", main.privateHalfStateForTest(asks[0]));
+    main.scanPrivateHalvesForTest(&fx);
+    try testing.expectEqualStrings("asking", main.privateHalfStateOfForTest(mute_half));
+}
