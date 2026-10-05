@@ -495,3 +495,44 @@ test "a sealed private half is open the moment it is published, with nothing ask
     main.setSignerKindForTest("remote");
     try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, [_]u8{0xe2} ** 32, true));
 }
+
+test "a private bookmark write wipes each copy of the list before it frees it" {
+    // The plaintext built for the seal, and the request that carries it to
+    // Notary, were freed as they were. Every other copy of a private half is
+    // wiped first; these two held the whole list, and the entry being added.
+    main.forgetBookmarksForTest();
+    main.forgetPrivateSealForTest();
+    main.forgetPrivateHalvesForTest();
+    defer {
+        main.setPlainGpaForTest(null);
+        main.forgetPrivateSealForTest();
+        main.forgetBookmarksForTest();
+        main.clearIdentityForTest();
+        main.setStoreForTest(null);
+        main.forgetPrivateHalvesForTest();
+    }
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [128]u8 = undefined;
+    const db_path = try std.fmt.bufPrintZ(&pbuf, ".zig-cache/tmp/{s}/bmwipe.mdb", .{tmp.sub_path});
+    var store = try nostr.store.Store.open(db_path, .{});
+    defer store.deinit();
+    _ = try bookmarkFixture(arena, &signer, &store, &.{}, "");
+
+    const note = [_]u8{0xc6} ** 32;
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{note});
+    var check = harness.WipeCheck{ .marker = &hex };
+    main.setPlainGpaForTest(check.allocator());
+    var fx: main.EffectsForTest = undefined;
+    try testing.expectEqual(main.BookmarkWrite.published, main.writePrivateBookmarkForTest(&fx, note, true));
+    main.setPlainGpaForTest(null);
+    // The seal was asked for with the entry in it, so a copy did exist.
+    try testing.expect(std.mem.indexOf(u8, main.lastSealPlaintextForTest(), &hex) != null);
+    try testing.expectEqual(@as(u32, 0), check.unwiped);
+}

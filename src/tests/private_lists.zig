@@ -619,3 +619,60 @@ test "a list whose half found no slot is read again once one comes free" {
     main.scanPrivateHalvesForTest(&fx);
     try testing.expectEqualStrings("asking", main.privateHalfStateOfForTest(mute_half));
 }
+
+test "an answer that opens a private half is wiped before it is freed" {
+    // Notary's answer and a bunker's are parsed into copies of the plaintext,
+    // and the bunker's arrives as a decrypted message holding it too. Each was
+    // freed as it was, while the slot it filled is wiped when it is let go.
+    main.forgetPrivateHalvesForTest();
+    main.clearPendingForTest();
+    defer {
+        main.setPlainGpaForTest(null);
+        main.setSignerKindForTest("helper");
+        main.clearPendingForTest();
+        main.forgetPrivateHalvesForTest();
+    }
+    var hex: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&hex, "{x}", .{[_]u8{0x5b} ** 32});
+    var plain_buf: [96]u8 = undefined;
+    const plain = try std.fmt.bufPrint(&plain_buf, "[[\"p\",\"{s}\"]]", .{hex});
+
+    // From Notary.
+    {
+        const ciphertext = "a-half-notary-opens";
+        main.askPrivateHalfForTest(ciphertext);
+        const body = try std.json.Stringify.valueAlloc(testing.allocator, .{ .items = &[_][]const u8{plain} }, .{});
+        defer testing.allocator.free(body);
+        var check = harness.WipeCheck{ .marker = &hex };
+        main.setPlainGpaForTest(check.allocator());
+        main.deliverPrivateHalfForTest(200, body);
+        main.setPlainGpaForTest(null);
+        try testing.expect(main.privateHalfIsReadableForTest(ciphertext));
+        try testing.expectEqual(@as(u32, 0), check.unwiped);
+    }
+
+    // From a bunker, over NIP-46.
+    main.forgetPrivateHalvesForTest();
+    main.setSignerKindForTest("remote");
+    const gpa = std.heap.page_allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const client_kp = try signer.keyPairFromSecretKey([_]u8{0x13} ** 32);
+    const bunker_kp = try signer.keyPairFromSecretKey([_]u8{0x24} ** 32);
+    main.setRemotePubkeyForTest(bunker_kp.public_key);
+    const index = main.claimPrivateHalfPendingForTest("a-half-the-bunker-opens") orelse return error.NoSlot;
+    try testing.expect(main.registerRemoteHalfAskForTest(index, .nip44_decrypt));
+    const response = try std.json.Stringify.valueAlloc(gpa, .{ .id = "halfask", .result = plain, .@"error" = "" }, .{});
+    defer gpa.free(response);
+    var sealed = try nostr.nip46.seal(gpa, threaded.io(), signer, bunker_kp, client_kp.public_key, response, 1_700_000_000);
+    defer sealed.deinit();
+    var check = harness.WipeCheck{ .marker = &hex, .library_scratch = response };
+    main.setPlainGpaForTest(check.allocator());
+    main.deliverNip46ResponseForTest(signer, client_kp, sealed.event);
+    main.setPlainGpaForTest(null);
+    // Parked for the tick, so the answer was taken.
+    try testing.expect(main.halfInboxHoldsForTest());
+    try testing.expectEqual(@as(u32, 0), check.unwiped);
+}

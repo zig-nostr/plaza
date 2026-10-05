@@ -509,10 +509,25 @@ pub fn privateHalfOpened(gpa: std.mem.Allocator, list: HalfList, content: []cons
 }
 
 /// Frees what `privateHalfOpened` handed back, wiped first: it is the reader's
-/// private list.
+/// private list. The same for any other buffer that holds it in the clear.
 pub fn freePrivatePlain(gpa: std.mem.Allocator, plain: []u8) void {
+    if (plain.len == 0) return;
     std.crypto.secureZero(u8, plain);
-    gpa.free(plain);
+    // Not `free`, which in a safe build paints the buffer on its way out and
+    // so would hide from a test whether it was wiped at all.
+    gpa.rawFree(plain, .of(u8), @returnAddress());
+}
+
+/// What a buffer that holds a private list in the clear is allocated from. A
+/// test swaps in one that checks each such buffer was wiped before its free.
+pub fn plainGpa() std.mem.Allocator {
+    if (builtin.is_test) return g_plain_gpa_for_test;
+    return std.heap.page_allocator;
+}
+var g_plain_gpa_for_test: std.mem.Allocator = std.heap.page_allocator;
+
+pub fn setPlainGpaForTest(gpa: ?std.mem.Allocator) void {
+    g_plain_gpa_for_test = gpa orelse std.heap.page_allocator;
 }
 
 /// Takes slot `i` for this ciphertext and keeps a copy of it, because the ask
@@ -682,10 +697,14 @@ pub fn handlePrivateHalf(response: native_sdk.EffectResponse) void {
     const i = low - private_half_key_base;
     if (i >= g_private_halves.len) return;
     const seq: u32 = @truncate(response.key >> 16);
-    const gpa = std.heap.page_allocator;
+    const gpa = plainGpa();
     // Read before the lock is taken; applied only if the slot still waits on it.
+    // The parse copies the plaintext, so the copy is wiped before it is freed.
     var parsed: ?nostr.signer_ipc.Parsed(nostr.signer_ipc.CipherResult) = null;
-    defer if (parsed) |*p| p.deinit();
+    defer if (parsed) |*p| {
+        for (p.value.items) |item| std.crypto.secureZero(u8, @constCast(item));
+        p.deinit();
+    };
     const answered = response.outcome == .ok and response.status == 200;
     if (answered) parsed = nostr.signer_ipc.parse(nostr.signer_ipc.CipherResult, gpa, response.body) catch null;
 
@@ -980,9 +999,9 @@ pub fn answerPrivateHalfForTest(gpa: std.mem.Allocator, i: usize, content: []con
         handlePrivateHalf(.{ .key = key, .outcome = .ok, .status = 422, .body = "{\"error\":\"unreadable\"}" });
         return;
     };
-    defer gpa.free(plain);
+    defer freePrivatePlain(gpa, plain);
     const body = (nostr.signer_ipc.CipherResult{ .items = &.{plain} }).toJson(gpa) catch return;
-    defer gpa.free(body);
+    defer freePrivatePlain(gpa, body);
     handlePrivateHalf(.{ .key = key, .outcome = .ok, .status = 200, .body = body });
 }
 /// The same under a stated key, so an answer can be delivered after the ask it

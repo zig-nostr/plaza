@@ -20,6 +20,7 @@ const oneShotDeadline = main.oneShotDeadline;
 const withdrawLiveRelay = main.withdrawLiveRelay;
 const takeDownBunkerListener = main.takeDownBunkerListener;
 const parkHalfAnswer = main.parkHalfAnswer;
+const freePrivatePlain = main.freePrivatePlain;
 const parkSealAnswer = main.parkSealAnswer;
 const forgetPrivateSeal = main.forgetPrivateSeal;
 const PendingUndo = main.PendingUndo;
@@ -974,9 +975,12 @@ pub fn handleNip46Response(gpa: std.mem.Allocator, signer: nostr.keys.Signer, cl
     // machine to the reader's relays, or a failure that discards their note.
     if (!std.mem.eql(u8, &ev.pubkey, &g_remote_pubkey)) return;
     const plaintext = nostr.nip46.open(gpa, signer, client_kp.secret_key, ev) catch return;
-    defer gpa.free(plaintext);
+    // The answer to a decrypt is the reader's private list in the clear, here
+    // and in the parsed copy of it, so both are wiped before they are freed.
+    defer freePrivatePlain(gpa, plaintext);
     var resp = nostr.nip46.parseResponse(gpa, plaintext) catch return;
     defer resp.deinit();
+    defer std.crypto.secureZero(u8, @constCast(resp.value.result));
 
     if (resp.value.err.len != 0) {
         std.debug.print("plaza: [signer] {s}\n", .{resp.value.err});
@@ -1291,7 +1295,7 @@ pub fn deliverNip46ResponseForTest(
     ev: nostr.event.Event,
 ) void {
     handleNip46Response(
-        std.heap.page_allocator,
+        private_lists.plainGpa(),
         signer,
         client_kp,
         ev,

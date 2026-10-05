@@ -1095,6 +1095,98 @@ pub fn seedAuthorNotes(store: *nostr.store.Store, arena: std.mem.Allocator, auth
     }
 }
 
+/// The page allocator, counting each buffer that held `marker` and was let go
+/// without being wiped first: a copy of a private list left behind in freed
+/// memory.
+///
+/// `Allocator.free` paints a buffer before it reaches the allocator in a safe
+/// build, so what arrives here does not say whether it was wiped. So every call
+/// first looks through the live buffers for the marker, and a buffer that held
+/// it counts unless it arrives zeroed (`freePrivatePlain` wipes it and hands it
+/// over unpainted). One handed over whole, as an arena's chunk is, counts if
+/// the marker is still in it.
+pub const WipeCheck = struct {
+    marker: []const u8,
+    /// What the nostr library decrypts into before it unpads (two length bytes,
+    /// then the plaintext). Its own scratch, not a copy this app made or can
+    /// wipe, so that one buffer is not counted.
+    library_scratch: ?[]const u8 = null,
+    unwiped: u32 = 0,
+    live: [256]Live = undefined,
+    live_len: usize = 0,
+
+    const Live = struct { ptr: [*]u8, len: usize, held: bool };
+    const paint: u8 = 0xaa;
+
+    pub fn allocator(self: *WipeCheck) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn holds(self: *const WipeCheck, memory: []const u8) bool {
+        if (std.mem.indexOf(u8, memory, self.marker) == null) return false;
+        const plain = self.library_scratch orelse return true;
+        if (memory.len < 2 + plain.len) return true;
+        if (std.mem.readInt(u16, memory[0..2], .big) != plain.len) return true;
+        return !std.mem.eql(u8, memory[2..][0..plain.len], plain);
+    }
+
+    fn scan(self: *WipeCheck) void {
+        for (self.live[0..self.live_len]) |*l| {
+            if (!l.held and self.holds(l.ptr[0..l.len])) l.held = true;
+        }
+    }
+
+    fn find(self: *WipeCheck, ptr: [*]u8) ?*Live {
+        for (self.live[0..self.live_len]) |*l| {
+            if (l.ptr == ptr) return l;
+        }
+        return null;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        const self: *WipeCheck = @ptrCast(@alignCast(ctx));
+        self.scan();
+        const ptr = std.heap.page_allocator.rawAlloc(len, alignment, ret) orelse return null;
+        if (self.live_len < self.live.len) {
+            self.live[self.live_len] = .{ .ptr = ptr, .len = len, .held = false };
+            self.live_len += 1;
+        }
+        return ptr;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) bool {
+        const self: *WipeCheck = @ptrCast(@alignCast(ctx));
+        self.scan();
+        if (!std.heap.page_allocator.rawResize(memory, alignment, new_len, ret)) return false;
+        if (self.find(memory.ptr)) |l| l.len = new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret: usize) ?[*]u8 {
+        const self: *WipeCheck = @ptrCast(@alignCast(ctx));
+        self.scan();
+        const ptr = std.heap.page_allocator.rawRemap(memory, alignment, new_len, ret) orelse return null;
+        if (self.find(memory.ptr)) |l| {
+            l.ptr = ptr;
+            l.len = new_len;
+        }
+        return ptr;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        const self: *WipeCheck = @ptrCast(@alignCast(ctx));
+        self.scan();
+        const held = if (self.find(memory.ptr)) |l| l.held else false;
+        const unwiped = if (std.mem.allEqual(u8, memory, paint)) held else self.holds(memory);
+        if (unwiped) self.unwiped += 1;
+        if (self.find(memory.ptr)) |l| {
+            l.* = self.live[self.live_len - 1];
+            self.live_len -= 1;
+        }
+        std.heap.page_allocator.rawFree(memory, alignment, ret);
+    }
+};
+
 // ---- settings, relays and signing in: the dead ends --------------------------
 
 pub fn bookmarkFixture(

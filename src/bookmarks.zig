@@ -344,7 +344,7 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
     if (ownWriteUnstored(bookmark_list_kind)) return .not_read_back;
     const me = activePubkey() orelse return .failed;
     forgetPrivateAnnounce();
-    const gpa = std.heap.page_allocator;
+    const gpa = private_lists.plainGpa();
 
     const previous: ?OwnProfile = ownWriteBase(gpa, bookmark_list_kind) catch return .failed;
     defer if (previous) |prev| freeOwnProfile(gpa, prev);
@@ -363,7 +363,7 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
         // out, so this is the first.
         return .nothing_to_do;
     };
-    defer gpa.free(plaintext);
+    defer freePrivatePlain(gpa, plaintext);
     // Past what NIP-44 can seal. No signer can do it, so nothing is asked.
     if (plaintext.len > max_private_plain_len) return .failed;
     if (builtin.is_test) {
@@ -398,7 +398,8 @@ pub fn writePrivateBookmark(fx: *Effects, event_id: [32]u8, adding: bool) Bookma
         private_lists.clearPrivateSeal();
         return .failed;
     };
-    defer gpa.free(body);
+    // It carries the plaintext, so it is wiped the same way.
+    defer freePrivatePlain(gpa, body);
     if (builtin.is_test) {
         sealPrivateBookmarkForTest(gpa, plaintext);
         return .published;
@@ -666,11 +667,13 @@ pub fn sealPrivateBookmarkForTest(gpa: std.mem.Allocator, plaintext: []const u8)
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = main.g_io orelse threaded.io();
-    const sealed = nostr.nip44.encrypt(gpa, io, signer, kp.secret_key, kp.public_key, plaintext) catch {
+    // Notary seals in its own process, so its scratch copies of the list are
+    // not this one's to account for.
+    const sealed = nostr.nip44.encrypt(std.heap.page_allocator, io, signer, kp.secret_key, kp.public_key, plaintext) catch {
         private_lists.clearPrivateSeal();
         return;
     };
-    defer gpa.free(sealed);
+    defer std.heap.page_allocator.free(sealed);
     if (sealed.len > g_test_sealed.len) {
         private_lists.clearPrivateSeal();
         return;

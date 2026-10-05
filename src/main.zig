@@ -6405,6 +6405,7 @@ pub const rearmHalfAsk = private_lists.rearmHalfAsk;
 pub const refuseHalfAsk = private_lists.refuseHalfAsk;
 pub const applyHalfAnswer = private_lists.applyHalfAnswer;
 pub const freePrivatePlain = private_lists.freePrivatePlain;
+pub const setPlainGpaForTest = private_lists.setPlainGpaForTest;
 pub const HalfList = private_lists.HalfList;
 pub const privateHalfStateOfForTest = private_lists.privateHalfStateOfForTest;
 pub const readPrivateHalfForTest = private_lists.readPrivateHalfForTest;
