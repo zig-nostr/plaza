@@ -9,43 +9,6 @@ four clicks, and the feed renders from disk. It's built on the
 through [Notary](https://github.com/zig-nostr/notary) so your key never enters a
 client.
 
-> **Status: active development.** Plaza installs and runs today. It
-> opens straight into a feed, signed in as nobody: nine accounts to start from,
-> already populated, with a strip along the top offering a key when you want
-> one. Create an identity in Notary, bring an existing key there, or connect an
-> external signer over NIP-46. **Your key never enters Plaza.** There is no
-> field in it that can hold one. Plaza ships Notary, starts it as its own child
-> process, and asks it for signatures over a channel nothing else on the machine
-> can reach, so the process decoding images and parsing relay JSON holds no
-> secret and cannot be made to. The feed
-> carries real names, avatars and pictures, rendered from a local store that a
-> pool of background threads keeps filled, no IPC on the read path, so it is on
-> screen before any relay answers. Composing signs a note (in the keyholder, or
-> by a round-trip to an external signer), stores it at once and publishes it to
-> the pool. Search (the magnifier in the rail, or Cmd+L) finds a person by name. The profiles already on your machine answer first, instantly and with the network off, ranked with the people you follow first and then the people who follow you. Once you stop typing, NIP-50 search relays are asked too, and each result says which relay returned it, with every relay named whether it found anyone or not. The same field takes an address, and opens what it names: an npub or nprofile, a `name@domain` NIP-05 address, a note, or a place, including one on relays you do not read, because an address that carries relay hints is asked there too. Plaza gives hints back: an address it copies, and the reply, quote, repost and like it publishes, name a relay the note was seen on or one its author writes to, and name none when it knows of none. A `plaza://place/` link
-> opens somebody else's corner of Nostr: their relay, and whatever it serves,
-> without disturbing your own. Plaza also says when a newer version of itself is
-> out, with one press to the release page. It tells you rather than replacing
-> itself, and the check can be switched off in Settings, after which it makes no
-> request at all.
->
-> A video in a note is drawn as a video rather than as a web page, though it is
-> not played in place yet.
->
-> A picture can go into a note, or be set as an avatar or a banner. It is uploaded to a Blossom media server: the first in your published server list that takes it, or one of two built in when you have none. A card names the server and waits for a press before anything is sent, and the location and camera details in the file are removed first, comments and XMP included for a GIF. Settings lists the servers and edits the list.
->
-> A note whose author marked it sensitive (NIP-36) is covered by one line, the reason when there is one and a Show press that uncovers that note for the session. Its pictures, its link preview and the picture of any note it quotes are not fetched until you press Show, and an article with a warning is covered the same way. "Show sensitive notes without a warning" in Settings turns the covering off, and the composer can add a warning with an optional reason to a note you write.
->
-> A long-form article (NIP-23) opens in a reader of its own: the byline, title, summary and cover, then the body. An `naddr` for an article, in a note, in a quote or in the search field, opens it. A draft is not opened, and Plaza reads articles without writing them.
->
-> A relay that asks who you are (NIP-42) gets an answer only after it has refused something for want of one, and only if you have said yes. Allow or Don't allow is asked once per relay for each account. Once a relay has asked or been answered, its row in Settings carries a badge (ask first, identify or anonymous), and pressing the badge changes the choice. A relay that only sends a challenge and gates nothing is never asked about.
->
-> A quote card draws the picture of the note it quotes. The rows and controls that answer a click can be reached with Tab and pressed with Return or Space.
->
-> Pictures, avatars, banners and a place's logo are fetched only from a public address, never from a host on your own network. With the media proxy on, they are asked of the proxy, and go direct only when it refuses a host and "Ask the host when the proxy refuses" is on. A relay address taken from somebody else's note, relay list or place is dialled only when it is public.
->
-> Not there yet: playing a video where it sits, sending a zap, searching notes, and private messages.
-
 ![Plaza: a native feed read from disk. Zig and Metal, no Electron, and the feed is a local query.](docs/shots/hero.jpg)
 
 ## What it looks like
@@ -109,6 +72,58 @@ reorder, and the renderer has no shaping.
 ```sh
 scripts/package-linux.sh --notary <path>   # -> dist/plaza-<version>-linux-<arch>.tar.gz
 ```
+
+## What it does
+
+### Reading without an account
+
+Plaza opens straight into a feed, signed in as nobody: nine accounts to start from, already populated, with a strip along the top offering a key when you want one.
+
+### Your key stays in a signer
+
+Create an identity in Notary, bring an existing key there, or connect an external signer over NIP-46. Plaza has no field that can hold a key. It ships Notary, starts it as its own child process, and asks it for signatures over a channel nothing else on the machine can reach, so the process that decodes images and parses relay JSON holds no secret.
+
+### A feed from disk
+
+Names, avatars and pictures are rendered from a local store that a pool of background threads keeps filled, with no IPC on the read path, so the feed is on screen before any relay answers. Composing signs a note (in Notary, or by a round trip to an external signer), stores it at once and publishes it.
+
+### Search and addresses
+
+Search (the magnifier in the rail, or Cmd+L) finds a person by name. The profiles already on your machine answer first, with the network off, ranked with the people you follow first and then the people who follow you. Once you stop typing, NIP-50 search relays are asked too, and each result says which relay returned it, with every relay named whether it found anyone or not.
+
+The same field opens an address: an npub or nprofile, a `name@domain` NIP-05 address, a note, an article or a place, including one on relays you do not read, because an address that carries relay hints is asked there too. Plaza gives hints back: an address it copies, and the reply, quote, repost and like it publishes, name a relay the note was seen on or one its author writes to, and name none when it knows of none.
+
+### Pictures and video
+
+A picture can go into a note, or be set as an avatar or a banner. It is uploaded to a Blossom media server: the first in your published server list that takes it, or one of two built in when you have none. A card names the server and waits for a press before anything is sent, and the location and camera details in the file are removed first, comments and XMP included for a GIF. Settings lists the servers and edits the list.
+
+A video in a note is drawn as a video rather than as a web page, though it is not played in place yet.
+
+### Articles
+
+A long-form article (NIP-23) opens in a reader of its own: the byline, title, summary and cover, then the body. An `naddr` for an article, in a note, in a quote or in the search field, opens it. A draft is not opened, and Plaza reads articles without writing them.
+
+### Content warnings
+
+A note whose author marked it sensitive (NIP-36) is covered by one line, the reason when there is one and a Show press that uncovers that note for the session. Its pictures, its link preview and the picture of any note it quotes are not fetched until you press Show, and an article with a warning is covered the same way. "Show sensitive notes without a warning" in Settings turns the covering off, and the composer can add a warning with an optional reason to a note you write.
+
+### Relays that ask who you are
+
+A relay that asks who you are (NIP-42) gets an answer only after it has refused something for want of one, and only if you have said yes. Allow or Don't allow is asked once per relay for each account. Once a relay has asked or been answered, its row in Settings carries a badge (ask first, identify or anonymous), and pressing the badge changes the choice. A relay that only sends a challenge and gates nothing is never asked about.
+
+### What it fetches, and from where
+
+Pictures, avatars, banners and a place's logo are fetched only from a public address, never from a host on your own network. With the media proxy on, they are asked of the proxy, and go direct only when it refuses a host and "Ask the host when the proxy refuses" is on. A relay address taken from somebody else's note, relay list or place is dialled only when it is public.
+
+Plaza says when a newer version of itself is out, with one press to the release page. It tells you rather than replacing itself, and the check can be switched off in Settings, after which it makes no request at all.
+
+### Keyboard
+
+The rows and controls that answer a click can be reached with Tab and pressed with Return or Space.
+
+### Not there yet
+
+Playing a video where it sits, sending a zap, searching notes, and private messages.
 
 ## What it speaks
 
