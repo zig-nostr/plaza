@@ -1,5 +1,11 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.25.1
+
+**A malformed note can no longer crash Plaza.** A note whose timestamp was one particular oversized number crashed the parser. It is refused now, like any other note that cannot be used.
+
+**Plaza carries Notary 0.11.3.** An app that asks your keyholder to encrypt or decrypt a direct message the older way (NIP-04) now reaches the Allow or Deny queue, where before the request was refused without asking you. The Notary window Plaza opens is otherwise unchanged.
+
 ### What's new in v0.25.0
 
 **Notes their authors marked sensitive are covered.** A note with a content warning (NIP-36) now shows one line, "Content warning" and the reason if there is one, with a Show press, in place of its words, pictures and link preview. Nothing in it is fetched until you press Show, and Show uncovers that one note for the session. That covers the picture of a note it quotes, and an article with a warning opens covered too, with no title, cover or body until you press Show. "Show sensitive notes without a warning" in Settings turns the covering off. When you write a note, "Add a content warning" in the composer adds one, with an optional reason.
