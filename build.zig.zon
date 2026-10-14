@@ -5,7 +5,7 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         // The Native SDK framework, pinned to the tree matching the `native`
-        // CLI (0.10.1 -> tag v0.10.1). `native eject` writes a machine-local
+        // CLI (0.11.0 -> tag v0.11.0). `native eject` writes a machine-local
         // `.path` into the npm install here; this git pin is committable and
         // reproducible instead, CI fetches the exact framework by hash.
         //
@@ -14,19 +14,21 @@
         // CLI and the framework speak different protocol versions, and moving
         // one alone does not fail the build: it silently breaks every live test.
         //
-        // A fork rather than vercel-labs/native, for eight patches. Every one is
+        // A fork rather than vercel-labs/native, for seven patches. Every one is
         // a gap that only shows off macOS, where the toolkit's own software
         // renderer is the whole of what a user sees, and none is fixable from
-        // up here:
+        // up here (a patch numbered 4 is gone, see below):
         //
         //   1. It inks every glyph from one face and stops at U+FFFF, so an
         //      emoji is a solid block. The fork reads cmap format 12 and
         //      COLR/CPAL, so a registered colour face draws real emoji.
         //      Upstream vercel-labs/native#421.
-        //   2. It bundles no face for the weight ids it maps spans onto, so
-        //      medium and bold ink regular outlines and there is no
-        //      typographic hierarchy at all. The fork lets an app fill those
-        //      four ids, which is what `registered_fonts` in main.zig does.
+        //   2. It bundled no face for the weight ids it maps spans onto, so
+        //      medium and bold inked regular outlines and there was no
+        //      typographic hierarchy at all. Upstream #688 now bundles Geist
+        //      Medium and Bold, which the fork carries. What stays is the
+        //      gate: an app still cannot fill those four ids with its own
+        //      family, which is what `registered_fonts` in main.zig does.
         //      Upstream vercel-labs/native#423.
         //   3. A font id resolves to exactly one face, so a codepoint the
         //      bundled faces lack is a solid block however many faces the app
@@ -36,8 +38,8 @@
         //      `registered_fonts` are for.
         //   4. The GTK present path threw away the dirty rectangle the runtime
         //      had just computed and converted the whole surface every frame.
-        //      The fork uses it, which is upstream's own Windows code one
-        //      platform over.
+        //      Fixed upstream in v0.11.0 (#434), so the fork no longer carries
+        //      it.
         //   5. Every GTK scroll signal ran a full synchronous engine dispatch
         //      inside the signal handler. At the 100 to 200 events a second a
         //      high-resolution wheel or a touchpad delivers, that work outlasts
@@ -51,8 +53,9 @@
         //      to the offset in one step, which is right for a trackpad and
         //      wrong for a wheel: one notch is 40 points in a 690 point
         //      viewport however slowly it arrives, so the feed jumped with
-        //      nothing drawn in between and no frame rate could help. The fork
-        //      travels it over about 200ms instead.
+        //      nothing drawn in between and no frame rate could help. Upstream
+        //      #470 (v0.11.0) marks a notch as detented and drops its fling;
+        //      the fork travels it over about 200ms instead.
         //      Upstream vercel-labs/native#441.
         //   7. The software rasteriser did per-pixel work that was either the
         //      same at every pixel or provably absent from the answer: the
@@ -64,22 +67,23 @@
         //      26.4ms to 7.1ms a frame, 23fps to 55fps.
         //      Upstream vercel-labs/native#443.
         //
-        // It is v0.10.1 plus those eight patches and nothing else, so any of
-        // them can be dropped on its own when it lands upstream. PATCHES.md in the fork is the tracker: one row per patch
-        // with its upstream issue and how to remove it. Nothing watches those
+        // It is v0.11.0 plus upstream #688 plus those seven patches and nothing
+        // else, so any of them can be dropped on its own when it lands upstream.
+        // PATCHES.md in the fork is the tracker: one row per patch with its
+        // upstream issue and how to remove it. Nothing watches those
         // issues automatically; the list is short enough to read.
         //
         // Note the revert is not one line. src/tests.zig calls hasColorGlyphs()
         // and colorLayerCount(), which are the fork's own API, so Plaza does
         // not compile against vercel-labs/native until those go too.
         //
-        // Also reachable as the tag `plaza-linux-gaps-4`, so the commit this
-        // fetches does not depend on one branch surviving. A branch deleted or
-        // force-pushed past it takes the dependency down for every cold
-        // checkout while a warm Zig cache hides it locally.
+        // The commit is on the branch `sdk-0.11.0`. A branch deleted or
+        // force-pushed past it would take the dependency down in the same way,
+        // so if that branch is ever rewritten, tag the commit first. A cold
+        // checkout would fail while a warm Zig cache hides it locally.
         .native_sdk = .{
-            .url = "git+https://github.com/zig-nostr/native.git#0eee6e3b09bf6ee054e7c62956097ea033bd062e",
-            .hash = "native_sdk-0.1.0-hzDzQj5QsgJf3gwFivco6sig1wjGaQcE_2heLFq5zNAU",
+            .url = "git+https://github.com/zig-nostr/native.git#caa09b31b0fcc6ab6e75660e370cf18373a6afd4",
+            .hash = "native_sdk-0.1.0-hzDzQtY-SQNMo1tz2hay2oYMrxw2JwPltLKZDdildHyj",
         },
         // The zig-nostr protocol library, linked directly into this app process
         // (it vendors secp256k1 + LMDB). Plaza opens the local store in the

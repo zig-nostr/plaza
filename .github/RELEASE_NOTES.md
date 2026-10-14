@@ -1,5 +1,13 @@
 **Plaza** is a fast, local-first Nostr client, built natively in Zig. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.25.2
+
+**On Linux, drawing no longer leaks memory.** Each frame that drew text left a little memory behind on every helper thread, so Plaza grew the longer it ran. The helper threads are now made once and reused.
+
+**On Linux, wheel scrolling is steadier.** A wheel notch after a pause starts moving at once instead of waiting for the next redraw, and Home or End is no longer pulled back by a notch that was still travelling.
+
+**Plaza carries Notary 0.11.4.** On Linux, the Notary window Plaza opens stays responsive when you scroll with a touchpad or a fast wheel, a mouse wheel notch moves a set distance and stops instead of gliding on, and the window draws faster. Nothing else changes, and nothing you can see changes on macOS.
+
 ### What's new in v0.25.1
 
 **A malformed note can no longer crash Plaza.** A note whose timestamp was one particular oversized number crashed the parser. It is refused now, like any other note that cannot be used.
