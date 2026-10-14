@@ -35,7 +35,7 @@ permissions:
 jobs:
   macos-app:
     name: package · ad-hoc sign · publish
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -49,10 +49,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install the Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.10.1
+        run: npm install -g @native-sdk/cli@0.11.0
 
       # The tests run on every pull request, but a tag can be pushed at any
       # commit, and a release is the one artifact nobody gets to re-check. So the
@@ -185,10 +185,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install the Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.10.1
+        run: npm install -g @native-sdk/cli@0.11.0
 
       # gtk4 only, for the same reason ci.yml gives: Plaza declares no web use,
       # so installing WebKit here would hide a regression that made it real.

@@ -12,7 +12,7 @@ permissions:
 jobs:
   # The full check on the platform Plaza ships from today.
   app:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -26,10 +26,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install the Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.10.1
+        run: npm install -g @native-sdk/cli@0.11.0
 
       # The typed half of `native check` reads zig-out/model-contract.zon, which
       # is emitted rather than committed, so a fresh checkout does not have one.
@@ -293,10 +293,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install the Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.10.1
+        run: npm install -g @native-sdk/cli@0.11.0
 
       # gtk4 only. Plaza draws on a canvas and declares no web use, so the host
       # compiles with the WebKitGTK stub and links gtk4 and libdl and nothing
@@ -346,7 +346,7 @@ jobs:
           if-no-files-found: error
 
   acceptance:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -360,10 +360,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install the Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.10.1
+        run: npm install -g @native-sdk/cli@0.11.0
 
       - name: A cold start, in a real window
         env:

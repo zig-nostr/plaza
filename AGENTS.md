@@ -37,7 +37,7 @@ Every module imports `main.zig` and takes the names it uses from there (`const M
 
 Zig 0.16.0 exactly (pinned in `.zigversion`).
 
-On macOS, with the Native SDK CLI (`npm install -g @native-sdk/cli@0.10.1`, the version CI uses):
+On macOS, with the Native SDK CLI (`npm install -g @native-sdk/cli@0.11.0`, the version CI uses):
 
 ```sh
 zig build model-contract   # emit the model contract first, or native check skips its typed checks
