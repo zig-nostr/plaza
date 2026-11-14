@@ -790,6 +790,8 @@ pub fn scanNip05Fetches(fx: *Effects) void {
         fx.fetch(.{
             .key = nip05_fetch_key_base + @as(u64, @intCast(i)),
             .url = url,
+            // The address is a stranger's too: no redirect following.
+            .max_redirects = 0,
             .on_response = Effects.responseMsg(.nip05_verified),
         });
         fired += 1;
