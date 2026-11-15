@@ -221,6 +221,12 @@ pub fn mediaFetchAllowedForTest(url: []const u8) bool {
 
 /// Whether a host is a literal address inside a range that belongs to the
 /// reader's own machine or network.
+///
+/// This reads the literal only. A NAME that resolves into one of these
+/// ranges sails past: the dial happens later, in the fetch layer, where
+/// std resolves the name itself. Closing that gap needs resolution-time
+/// validation (resolve, judge every answer, then connect) in the fetch
+/// effect; until then the gate is honest about what it can see.
 pub fn isPrivateAddress(host: []const u8) bool {
     var parts: [4]u16 = undefined;
     var n: usize = 0;
@@ -236,8 +242,13 @@ pub fn isPrivateAddress(host: []const u8) bool {
         0, 10, 127 => true,
         169 => parts[1] == 254, // link-local
         172 => parts[1] >= 16 and parts[1] <= 31,
-        192 => parts[1] == 168,
+        // 192.168/16, and the NAT64 gateway block 192.0.0.0/24
+        192 => parts[1] == 168 or (parts[1] == 0 and parts[2] == 0),
         100 => parts[1] >= 64 and parts[1] <= 127, // carrier-grade NAT
+        198 => parts[1] >= 18 and parts[1] <= 19, // 198.18.0.0/15 benchmark
+        // The whole tail of the space is not a media origin either:
+        // 224/4 multicast, 240/4 reserved, 255.255.255.255 broadcast.
+        224...255 => true,
         else => false,
     };
 }
@@ -371,6 +382,11 @@ fn fireLink(fx: *Effects, note: *const Note, fired: *usize) void {
     fx.fetch(.{
         .key = link_fetch_key_base + index,
         .url = slot.url(),
+        // No redirect following: this URL passed the gate, and std
+        // would follow hops the gate never saw (a 302 to a loopback
+        // or LAN address gets dialed anyway). A host that only serves
+        // its card behind a redirect just gets no card.
+        .max_redirects = 0,
         .on_response = Effects.responseMsg(.link_fetched),
     });
 }

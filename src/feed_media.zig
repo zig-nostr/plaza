@@ -577,6 +577,9 @@ pub fn fetchSlice(fx: *Effects, key: u64, url: []const u8, offset: usize, on_res
     fx.fetch(.{
         .key = key,
         .url = url,
+        // No redirect following on a stranger-supplied URL: see
+        // link_preview.zig.
+        .max_redirects = 0,
         // `identity` is not politeness, it is what makes the arithmetic true.
         // The HTTP client asks for gzip by default, and a range together with a
         // content encoding means the slice boundaries are in ENCODED bytes

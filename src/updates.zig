@@ -126,6 +126,11 @@ pub fn maybeCheckForUpdate(fx: *Effects) void {
         // What the API wants to be asked for. Without it the answer is the v3
         // default, which is the same shape today and is not promised to stay.
         .headers = &.{.{ .name = "accept", .value = "application/vnd.github+json" }},
+        // github.com is not a stranger, but the request is on a timer and
+        // answers to nobody here: follow no redirects. Name the app while
+        // asking, instead of std's `zig/<version>`.
+        .max_redirects = 0,
+        .user_agent = "plaza/" ++ plaza_version,
         .timeout_ms = 10_000,
         .on_response = Effects.responseMsg(.update_checked),
     });

@@ -331,6 +331,10 @@ fn warmAvatar(fx: *Effects, p: *Profile) bool {
     fx.fetch(.{
         .key = avatar_warm_key_base + index,
         .url = url,
+        // No redirect following on a stranger-supplied URL: see
+        // link_preview.zig. A hop the URL gate never judged is not
+        // dialed.
+        .max_redirects = 0,
         .on_response = Effects.responseMsg(.avatar_warmed),
     });
     return true;
@@ -355,6 +359,9 @@ fn warmPicture(fx: *Effects, note: *const Note) bool {
     fx.fetch(.{
         .key = media_warm_key_base + index,
         .url = url,
+        // No redirect following on a stranger-supplied URL: see
+        // link_preview.zig.
+        .max_redirects = 0,
         .on_response = Effects.responseMsg(.media_warmed),
     });
     return true;
